@@ -1,0 +1,16 @@
+#Description: 3D test problem for testing chemical reactions
+#             based on chemistry from Hammond and Lichtner, WRR, 2010
+
+
+EXTERNAL_FILE simulation.txt
+
+
+SUBSURFACE
+
+#=========================== datasets =========================================
+DATASET temperature
+  HDF5_DATASET_NAME east_surface_cell_centered
+  FILENAME dataset.h5
+END
+
+EXTERNAL_FILE subsurface.txt

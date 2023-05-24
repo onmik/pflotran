@@ -1,0 +1,1874 @@
+! Process Model Coupler Base class
+module PMC_Base_class
+
+#include "petsc/finclude/petscsys.h"
+  use petscsys
+  use PM_Base_class
+  use Timestepper_Base_class
+  use Option_module
+  use Output_Aux_module
+  use Waypoint_module
+  use PM_Base_Pointer_module
+  use Output_module, only : Output
+  use Simulation_Aux_module
+
+  use PFLOTRAN_Constants_module
+
+  implicit none
+
+  private
+
+  PetscInt, parameter, public :: PM_CHILD = 0
+  PetscInt, parameter, public :: PM_PEER = 1
+  PetscInt, parameter, public :: PM_APPEND = 0
+  PetscInt, parameter, public :: PM_INSERT = 1
+
+  ! process model coupler type
+  type, public :: pmc_base_type
+    character(len=MAXWORDLENGTH) :: name
+    PetscLogStage :: stage
+    PetscBool :: is_master
+    PetscLogDouble :: cumulative_time
+    type(option_type), pointer :: option
+    class(timestepper_base_type), pointer :: timestepper
+    class(pm_base_type), pointer :: pm_list
+    type(waypoint_list_type), pointer :: waypoint_list
+    class(pmc_base_type), pointer :: child
+    class(pmc_base_type), pointer :: peer
+    type(pm_base_pointer_type), pointer :: pm_ptr
+    type(simulation_aux_type),pointer :: sim_aux
+    procedure(Output), nopass, pointer :: Output
+  contains
+    procedure, public :: Init => PMCBaseInit
+    procedure, public :: ReadNumericalMethods => PMCBaseReadNumericalMethods
+    procedure, public :: InitializeRun => PMCBaseInitializeRun
+    procedure, public :: SetWaypointPtr => PMCBaseSetWaypointPtr
+    procedure, public :: InputRecord => PMCBaseInputRecord
+    procedure, public :: CastToBase => PMCCastToBase
+    procedure, public :: SetTimestepper => PMCBaseSetTimestepper
+    procedure, public :: SetupSolvers => PMCBaseSetupSolvers
+    procedure, public :: RunToTime => PMCBaseRunToTime
+    procedure, public :: PrintHeader => PMCBasePrintHeader
+    procedure, public :: StepDT => PMCBaseStepDT
+    procedure, public :: Checkpoint => PMCBaseCheckpoint
+    procedure, public :: CheckpointBinary => PMCBaseCheckpointBinary
+    procedure, public :: RestartBinary => PMCBaseRestartBinary
+    procedure, public :: CheckpointHDF5 => PMCBaseCheckpointHDF5
+    procedure, public :: RestartHDF5 => PMCBaseRestartHDF5
+    procedure, public :: FinalizeRun => PMCBaseFinalizeRun
+    procedure, public :: OutputLocal
+    procedure, public :: UpdateSolution => PMCBaseUpdateSolution
+    procedure, public :: Destroy => PMCBaseDestroy
+    procedure, public :: AccumulateAuxData
+    procedure, public :: GetAuxData
+    procedure, public :: SetAuxData
+    procedure, public :: CheckNullPM => PMCBaseCheckNullPM
+    procedure, public :: SetName
+    procedure, public :: SetOption
+    procedure, public :: SetWaypointList
+    !procedure, public :: SetChildPeerPtr => PMCBaseSetChildPeerPtr
+  end type pmc_base_type
+
+  abstract interface
+    subroutine Synchronize(pmc)
+      import pmc_base_type
+      implicit none
+        class(pmc_base_type) :: pmc
+    end subroutine Synchronize
+  end interface
+
+  ! For checkpointing
+  type, public :: pmc_base_header_type
+    PetscInt :: plot_number      ! in the checkpoint file format
+    PetscInt :: times_per_h5_file! in the checkpoint file format
+  end type pmc_base_header_type
+
+  interface PetscBagGetData
+    subroutine PetscBagGetData(bag,header,ierr)
+      import :: pmc_base_header_type
+      implicit none
+      PetscBag :: bag
+      class(pmc_base_header_type), pointer :: header
+      PetscErrorCode :: ierr
+    end subroutine
+  end interface PetscBagGetData
+
+  public :: PMCBaseCreate, &
+            PMCBaseInit, &
+            PMCBaseInitializeRun, &
+            PMCBaseInputRecord, &
+            PMCBaseSetChildPeerPtr, &
+            PMCBaseFinalizeRun, &
+            PMCBaseStrip, &
+            SetOutputFlags
+
+contains
+
+! ************************************************************************** !
+
+function PMCBaseCreate()
+  !
+  ! Allocates and initializes a new process model coupler object.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 06/10/13
+  !
+
+  implicit none
+
+  class(pmc_base_type), pointer :: PMCBaseCreate
+
+  class(pmc_base_type), pointer :: pmc
+
+#ifdef DEBUG
+  print *, 'PMCBase%Create()'
+#endif
+
+  allocate(pmc)
+  call pmc%Init()
+
+  PMCBaseCreate => pmc
+
+end function PMCBaseCreate
+
+! ************************************************************************** !
+
+subroutine PMCBaseInit(this)
+  !
+  ! Initializes a new process model coupler object.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 06/10/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+#ifdef DEBUG
+  print *, 'PMCBase%Init()'
+#endif
+
+  this%name = 'PMCBase'
+  this%stage = 0
+  this%is_master = PETSC_FALSE
+  this%cumulative_time = 0.d0
+  nullify(this%option)
+  nullify(this%timestepper)
+  nullify(this%pm_list)
+  nullify(this%waypoint_list)
+  nullify(this%child)
+  nullify(this%peer)
+  nullify(this%sim_aux)
+  this%Output => null()
+
+  allocate(this%pm_ptr)
+  nullify(this%pm_ptr%pm)
+
+end subroutine PMCBaseInit
+
+! ************************************************************************** !
+
+subroutine PMCBaseReadNumericalMethods(this,input,pm_label)
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/09/20
+  !
+  use Input_Aux_module
+  use Solver_module
+  use String_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  type(input_type), pointer :: input
+  character(len=MAXWORDLENGTH) :: pm_label
+
+  type(option_type), pointer :: option
+  character(len=MAXWORDLENGTH) :: keyword
+  character(len=MAXSTRINGLENGTH) :: error_string
+  PetscBool :: found
+
+  option => this%option
+
+  if (.not.associated(this%timestepper)) then
+    option%io_buffer = 'No time integrator is used with process model "' // &
+      trim(this%pm_list%name) // '". Therefore, a NUMERICAL_METHODS card &
+      &may not be used.'
+  endif
+
+  input%ierr = 0
+  call InputPushBlock(input,option)
+  do
+
+    call InputReadPflotranString(input,option)
+
+    if (InputCheckExit(input,option)) exit
+
+    error_string = 'SUBSURFACE,NUMERICAL_METHODS,'//pm_label
+    call InputReadCard(input,option,keyword)
+    call InputErrorMsg(input,option,'keyword',error_string)
+    call StringToUpper(keyword)
+
+    select case(trim(keyword))
+      case ('TIMESTEPPER')
+        error_string = trim(error_string) // ',TIMESTEPPER'
+        call InputPushBlock(input,option)
+        do
+          call InputReadPflotranString(input,option)
+          if (InputCheckExit(input,option)) exit
+          call InputReadCard(input,option,keyword)
+          call InputErrorMsg(input,option,'keyword',error_string)
+          call StringToUpper(keyword)
+
+          ! leave in this order as PM overrides TS
+          found = PETSC_TRUE
+          call this%pm_list%ReadTSBlock(input,keyword,found, &
+                                        error_string,option)
+          if (.not.found) then
+            found = PETSC_TRUE
+            call this%timestepper%ReadSelectCase(input,keyword,found, &
+                                                 error_string,option)
+          endif
+          if (.not.found) then
+            call InputKeywordUnrecognized(input,keyword,error_string,option)
+          endif
+        enddo
+        call InputPopBlock(input,option)
+      case ('NEWTON_SOLVER')
+        error_string = trim(error_string) // ',NEWTON_SOLVER'
+        call InputPushBlock(input,option)
+        do
+          call InputReadPflotranString(input,option)
+          if (InputCheckExit(input,option)) exit
+          call InputReadCard(input,option,keyword)
+          call InputErrorMsg(input,option,'keyword',error_string)
+          call StringToUpper(keyword)
+
+          ! leave in this order as PM overrides TS
+          found = PETSC_TRUE
+          call this%pm_list%ReadNewtonBlock(input,keyword,found, &
+                                            error_string,option)
+          if (.not.found) then
+            found = PETSC_TRUE
+            call SolverReadNewtonSelectCase(this%timestepper%solver,input, &
+                                            keyword,found,error_string,option)
+          endif
+          if (.not.found) then
+            call InputKeywordUnrecognized(input,keyword,error_string,option)
+          endif
+        enddo
+        call InputPopBlock(input,option)
+      case ('LINEAR_SOLVER')
+        call SolverReadLinear(this%timestepper%solver,input,option)
+      case default
+        call InputKeywordUnrecognized(input,keyword,error_string,option)
+    end select
+  enddo
+  call InputPopBlock(input,option)
+
+end subroutine PMCBaseReadNumericalMethods
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseInputRecord(this)
+  !
+  ! Writes ingested information to the input record file.
+  !
+  ! Author: Jenn Frederick, SNL
+  ! Date: 03/21/2016
+  !
+
+  use PM_Base_class
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+  class(pm_base_type), pointer :: cur_pm
+  PetscInt :: id
+
+  id = INPUT_RECORD_UNIT
+
+  ! print information about self
+  write(id,'(a)') ' '
+  write(id,'(a29)',advance='no') '---------------------------: '
+  write(id,'(a)') ' '
+  write(id,'(a29)',advance='no') 'pmc: '
+  write(id,'(a)') this%name
+  if (associated(this%timestepper)) then
+    call this%timestepper%inputrecord
+  endif
+  cur_pm => this%pm_list
+  do ! loop through this pmc's process models
+    if (.not.associated(cur_pm)) exit
+    call cur_pm%inputrecord
+    cur_pm => cur_pm%next
+  enddo
+
+  ! print information about child's pmc
+  if (associated(this%child)) then
+    call this%child%inputrecord
+  endif
+  ! print information about peer's pmc
+  if (associated(this%peer)) then
+    call this%peer%inputrecord
+  endif
+
+end subroutine PMCBaseInputRecord
+
+! ************************************************************************** !
+
+subroutine PMCBaseSetWaypointPtr(this,outer_waypoint_list)
+  !
+  ! Initializes the timestepper for the simulation.  This is more than just
+  ! initializing parameters.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 11/21/14
+  !
+
+  use Option_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  type(waypoint_list_type), pointer :: outer_waypoint_list
+
+  call this%timestepper%SetWaypointPtr(outer_waypoint_list, &
+                                       this%is_master,this%option)
+
+end subroutine PMCBaseSetWaypointPtr
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseSetChildPeerPtr(pmcA,relationship_to,pmcB, &
+                                            pmcB_parent,position_instruction)
+  !
+  ! Orders pmcA under pmcB relative to the specified relationship (child or
+  ! peer) and insert/append instruction. If pmcB's parent is not relevant, a
+  ! null dummy pointer of pmc_base_type should be passed in.
+  !
+  ! Author: Jenn Frederick, SNL
+  ! Date: 02/15/2017
+  !
+
+  use PM_Base_class
+  use Option_module
+
+  implicit none
+
+  class(pmc_base_type), pointer :: pmcA
+  PetscInt :: relationship_to
+  class(pmc_base_type), pointer :: pmcB
+  class(pmc_base_type), pointer :: pmcB_parent
+  class(pmc_base_type), pointer :: pmcB_dummy
+  PetscInt :: position_instruction
+
+  PetscInt :: new_relationship
+
+  nullify(pmcB_dummy)
+
+  if (.not.associated(pmcB)) then
+    pmcA%option%io_buffer = 'pmcB passed PMCBaseSetChildPeerPtr is not &
+                            &associated.'
+    call PrintErrMsg(pmcA%option)
+  endif
+
+  select case(relationship_to)
+  !--------------------------------------------------------
+    case(PM_CHILD)
+      if (associated(pmcB%child)) then
+        new_relationship = PM_PEER
+        call PMCBaseSetChildPeerPtr(pmcA,new_relationship,pmcB%child,pmcB, &
+                                    position_instruction)
+      else
+        pmcB%child => pmcA
+#ifdef DEBUG
+        pmcA%option%io_buffer = trim(pmcA%name)// ' assigned as first child&
+                                & of ' // trim(pmcB%name) // '.'
+        call PrintMsg(pmcA%option)
+#endif
+      endif
+  !--------------------------------------------------------
+    case(PM_PEER)
+      select case(position_instruction)
+      !----------------------------------------------------
+        case(PM_APPEND)
+          if (associated(pmcB%peer)) then
+            new_relationship = PM_PEER
+            call PMCBaseSetChildPeerPtr(pmcA,new_relationship,pmcB%peer, &
+                                        pmcB_dummy,position_instruction)
+          else
+            pmcB%peer => pmcA
+#ifdef DEBUG
+        pmcA%option%io_buffer = trim(pmcA%name) // ' assigned as peer of ' // &
+                                trim(pmcB%name) // ' via "append".'
+        call PrintMsg(pmcA%option)
+#endif
+          endif
+      !----------------------------------------------------
+        case(PM_INSERT)
+          pmcA%peer => pmcB
+          if (associated(pmcB_parent)) then
+            pmcB_parent%child => pmcA
+#ifdef DEBUG
+        pmcA%option%io_buffer = trim(pmcA%name)// ' assigned as first child&
+                                & of ' // trim(pmcB%name) // ' via "insert".'
+        call PrintMsg(pmcA%option)
+#endif
+          else
+            pmcA%option%io_buffer = 'Null pointer for pmcB_parent passed into &
+                                     &PMCBaseSetChildPeerPtr.'
+            call PrintErrMsg(pmcA%option)
+          endif
+      !----------------------------------------------------
+      end select
+  !--------------------------------------------------------
+    case default
+      pmcA%option%io_buffer = 'PMC relationship_to not understood in &
+                              &PMCBaseSetChildPeerPtr.'
+      call PrintErrMsg(pmcA%option)
+  !--------------------------------------------------------
+  end select
+
+end subroutine PMCBaseSetChildPeerPtr
+
+! ************************************************************************** !
+
+function PMCCastToBase(this)
+  !
+  ! PMCBaseCastToBase: Casts an extended PMC to a pointer to the base class
+  !                    in order to avoid a 'select type' statement when
+  !                    pointing a pmc_base_type pointer to an extended class.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 06/10/13
+  !
+
+  implicit none
+
+  class(pmc_base_type), target :: this
+
+  class(pmc_base_type), pointer :: PMCCastToBase
+
+  PMCCastToBase => this
+
+end function PMCCastToBase
+
+! ************************************************************************** !
+
+subroutine PMCBaseSetupSolvers(this)
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/18/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+#ifdef DEBUG
+  call PrintMsg(this%option,'PMCBase%SetupSolvers()')
+#endif
+
+  ! For now there is nothing to be done here.  Most everything is done in
+  ! PMCSubsurface
+
+end subroutine PMCBaseSetupSolvers
+
+! ************************************************************************** !
+
+subroutine PMCBaseSetTimestepper(this,timestepper)
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/18/13
+  !
+
+  use Timestepper_Base_class
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  class(timestepper_base_type), pointer :: timestepper
+
+#ifdef DEBUG
+  call PrintMsg(this%option,'PMCBase%SetTimestepper()')
+#endif
+
+  this%timestepper => timestepper
+
+end subroutine PMCBaseSetTimestepper
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseInitializeRun(this)
+  !
+  ! Initializes the time stepping
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/18/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+  class(pm_base_type), pointer :: cur_pm
+
+#ifdef DEBUG
+  call PrintMsg(this%option,'PMCBase%InitializeRun()')
+#endif
+
+  if (associated(this%timestepper)) then
+    call this%timestepper%InitializeRun(this%option)
+  endif
+
+  cur_pm => this%pm_list
+  do
+    if (.not.associated(cur_pm)) exit
+    call cur_pm%InitializeRun()
+    cur_pm => cur_pm%next
+  enddo
+
+  if (associated(this%child)) then
+    call this%child%InitializeRun()
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%InitializeRun()
+  endif
+
+end subroutine PMCBaseInitializeRun
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseRunToTime(this,sync_time,stop_flag)
+  !
+  ! Runs the actual simulation.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/18/13
+  !
+  use Timestepper_Base_class
+  use Checkpoint_module
+
+  implicit none
+
+  class(pmc_base_type), target :: this
+  PetscReal :: sync_time
+  PetscInt :: stop_flag
+
+  character(len=MAXSTRINGLENGTH) :: filename_append
+  PetscInt :: local_stop_flag
+  PetscBool :: sync_flag
+  PetscBool :: checkpoint_at_this_time_flag
+  PetscBool :: snapshot_plot_at_this_time_flag
+  PetscBool :: observation_plot_at_this_time_flag
+  PetscBool :: massbal_plot_at_this_time_flag
+  PetscBool :: checkpoint_at_this_timestep_flag
+  PetscBool :: snapshot_plot_at_this_timestep_flag
+  PetscBool :: observation_plot_at_this_timestep_flag
+  PetscBool :: massbal_plot_at_this_timestep_flag
+  PetscBool :: peer_already_run_to_time
+  class(pm_base_type), pointer :: cur_pm
+  PetscErrorCode :: ierr
+
+  if (stop_flag == TS_STOP_FAILURE) return
+
+  if (this%stage /= 0) then
+    call PetscLogStagePush(this%stage,ierr);CHKERRQ(ierr)
+  endif
+  this%option%io_buffer = trim(this%name) // ':' // trim(this%pm_list%name)
+  call PrintVerboseMsg(this%option)
+
+  ! Get data of other process-model
+  call this%GetAuxData()
+
+  local_stop_flag = TS_CONTINUE
+  do
+    if (local_stop_flag /= TS_CONTINUE) exit ! end simulation
+    if (this%timestepper%target_time >= sync_time) exit
+
+    call SetOutputFlags(this)
+    sync_flag = PETSC_FALSE
+    checkpoint_at_this_time_flag = PETSC_FALSE
+    snapshot_plot_at_this_time_flag = PETSC_FALSE
+    observation_plot_at_this_time_flag = PETSC_FALSE
+    massbal_plot_at_this_time_flag = PETSC_FALSE
+    checkpoint_at_this_timestep_flag = PETSC_FALSE
+    snapshot_plot_at_this_timestep_flag = PETSC_FALSE
+    observation_plot_at_this_timestep_flag = PETSC_FALSE
+    massbal_plot_at_this_timestep_flag = PETSC_FALSE
+
+    call this%timestepper%SetTargetTime(sync_time,this%option, &
+                                        local_stop_flag, &
+                                        sync_flag, &
+                                        snapshot_plot_at_this_time_flag, &
+                                        observation_plot_at_this_time_flag, &
+                                        massbal_plot_at_this_time_flag, &
+                                        checkpoint_at_this_time_flag)
+    call this%StepDT(local_stop_flag)
+
+    if (this%timestepper%time_step_cut_flag) then
+      ! if timestep has been cut, all the I/O flags set above in
+      ! %SetTargetTime, which are based on waypoints times, not time step,
+      ! should be turned off
+      snapshot_plot_at_this_time_flag = PETSC_FALSE
+      observation_plot_at_this_time_flag = PETSC_FALSE
+      massbal_plot_at_this_time_flag = PETSC_FALSE
+      checkpoint_at_this_time_flag = PETSC_FALSE
+    endif
+    if (local_stop_flag == TS_STOP_FAILURE) exit ! failure
+    ! Have to loop over all process models coupled in this object and update
+    ! the time step size.  Still need code to force all process models to
+    ! use the same time step size if tightly or iteratively coupled.
+    cur_pm => this%pm_list
+    do
+      if (.not.associated(cur_pm)) exit
+      ! have to update option%time for conditions
+      this%option%time = this%timestepper%target_time
+      call cur_pm%UpdateSolution()
+      call this%timestepper%UpdateDT(cur_pm)
+      cur_pm => cur_pm%next
+    enddo
+
+    ! Accumulate data needed by process-model
+    call this%AccumulateAuxData()
+
+    ! Run underlying process model couplers
+    if (associated(this%child)) then
+      ! Set data needed by process-models
+      call this%SetAuxData()
+      call this%child%RunToTime(this%timestepper%target_time,local_stop_flag)
+      ! Get data from other process-models
+      call this%GetAuxData()
+    endif
+
+    ! output at time step flags
+    if (associated(this%Output)) then
+      ! if we are using the modulus of the output_option%imod, we may
+      ! still print
+      snapshot_plot_at_this_timestep_flag = &
+        (mod(this%timestepper%steps,this%pm_list% &
+              output_option%periodic_snap_output_ts_imod) == 0)
+      observation_plot_at_this_timestep_flag = &
+        (mod(this%timestepper%steps,this%pm_list% &
+              output_option%periodic_obs_output_ts_imod) == 0)
+      massbal_plot_at_this_timestep_flag = &
+        (mod(this%timestepper%steps,this%pm_list% &
+              output_option%periodic_msbl_output_ts_imod) == 0)
+      if (this%pm_list%steady_state) &
+        snapshot_plot_at_this_timestep_flag = PETSC_TRUE
+    endif
+
+    ! checkpoint at time step flags
+    if (this%is_master .and. associated(this%option%checkpoint)) then
+      if (this%option%checkpoint%periodic_ts_incr > 0) then
+        if (mod(this%timestepper%steps, &
+                this%option%checkpoint%periodic_ts_incr) == 0) then
+          checkpoint_at_this_timestep_flag = PETSC_TRUE
+        endif
+      endif
+    endif
+
+    peer_already_run_to_time = PETSC_FALSE
+    if (associated(this%peer)) then
+      if ( &
+          this%pm_list%output_option%force_synchronized_output .and. &
+          ! specified synchronization of process model couplers
+          (sync_flag .or. &
+          ! printing output
+          ! this%Output current performs actions beyond solely
+          ! outputing data (e.g. time averaging of data). but
+          ! we should only force the peers on actual output
+            (snapshot_plot_at_this_time_flag .or. &
+             snapshot_plot_at_this_timestep_flag .or. &
+             observation_plot_at_this_time_flag .or. &
+             observation_plot_at_this_timestep_flag .or. &
+             massbal_plot_at_this_time_flag .or. &
+             massbal_plot_at_this_timestep_flag) .or. &
+          ! checkpointing
+          (this%is_master .and. &
+            (checkpoint_at_this_time_flag .or. &
+             checkpoint_at_this_timestep_flag)))) then
+        call this%SetAuxData()
+        ! Run neighboring process model couplers
+        call this%peer%RunToTime(this%timestepper%target_time, &
+                                local_stop_flag)
+        call this%GetAuxData()
+        peer_already_run_to_time = PETSC_TRUE
+      endif
+    endif
+
+    ! only print output for process models of depth 0
+    if (associated(this%Output)) then
+      call this%Output(this%pm_list%realization_base, &
+                       (snapshot_plot_at_this_time_flag .or. &
+                        snapshot_plot_at_this_timestep_flag), &
+                       (observation_plot_at_this_time_flag .or. &
+                        observation_plot_at_this_timestep_flag), &
+                       (massbal_plot_at_this_time_flag .or. &
+                        massbal_plot_at_this_timestep_flag))
+    endif
+
+    if (this%is_master) then
+      ! it is possible that two identical checkpoint files will be created,
+      ! one at the time and another at the time step, but this is fine.
+      if (checkpoint_at_this_time_flag) then
+        filename_append = &
+          CheckpointAppendNameAtTime(this%option%time,this%option)
+        call this%Checkpoint(filename_append)
+      endif
+      if (checkpoint_at_this_timestep_flag) then
+        filename_append = &
+          CheckpointAppendNameAtTimestep(this%timestepper%steps,this%option)
+        call this%Checkpoint(filename_append)
+      endif
+
+      if (this%timestepper%WallClockStop(this%option)) then
+         local_stop_flag = TS_STOP_WALLCLOCK_EXCEEDED
+      endif
+
+      ! must come after wall clock as steady state overrides
+      if (this%pm_list%steady_state) then
+        local_stop_flag = TS_STOP_END_SIMULATION
+      endif
+    endif
+
+  enddo
+
+  ! Set data needed by process-model
+  call this%SetAuxData()
+
+  ! Run neighboring process model couplers
+  if (associated(this%peer) .and. .not.peer_already_run_to_time) then
+    call this%peer%RunToTime(sync_time,local_stop_flag)
+  endif
+
+  stop_flag = max(stop_flag,local_stop_flag)
+
+  if (this%stage /= 0) then
+    call PetscLogStagePop(ierr);CHKERRQ(ierr)
+  endif
+
+end subroutine PMCBaseRunToTime
+
+! ************************************************************************** !
+
+subroutine PMCBasePrintHeader(this)
+  !
+  ! Author: Glenn Hammond
+  ! Date: 04/19/21
+  !
+  implicit none
+
+  class(pmc_base_type) :: this
+
+  call PMBasePrintHeader(this%pm_list)
+
+end subroutine PMCBasePrintHeader
+
+! ************************************************************************** !
+
+subroutine PMCBaseStepDT(this,stop_flag)
+  !
+  ! Author: Glenn Hammond
+  ! Date: 12/06/19
+  !
+  implicit none
+
+  class(pmc_base_type) :: this
+  PetscInt :: stop_flag
+
+  PetscLogDouble :: log_start_time
+  PetscLogDouble :: log_end_time
+  PetscErrorCode :: ierr
+
+  call PetscTime(log_start_time,ierr);CHKERRQ(ierr)
+  call this%PrintHeader()
+  call this%timestepper%StepDT(this%pm_list,stop_flag)
+  call PetscTime(log_end_time,ierr);CHKERRQ(ierr)
+  this%cumulative_time = this%cumulative_time + log_end_time - log_start_time
+
+end subroutine PMCBaseStepDT
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseUpdateSolution(this)
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/18/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+  class(pm_base_type), pointer :: cur_pm
+
+#ifdef DEBUG
+  call PrintMsg(this%option,'PMCBase%UpdateSolution()')
+#endif
+
+  cur_pm => this%pm_list
+  do
+    if (.not.associated(cur_pm)) exit
+    ! have to update option%time for conditions
+    this%option%time = this%timestepper%target_time
+    call cur_pm%UpdateSolution()
+    cur_pm => cur_pm%next
+  enddo
+
+end subroutine PMCBaseUpdateSolution
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseFinalizeRun(this)
+  !
+  ! Finalizes the time stepping
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/18/13
+  !
+  use Option_module
+  use String_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+#ifdef DEBUG
+  call PrintMsg(this%option,'PMCBase%FinalizeRun()')
+#endif
+
+  call PrintMsg(this%option,'')
+  this%option%io_buffer = this%name
+  call PrintMsg(this%option)
+  this%option%io_buffer = ' Total Time: ' // &
+    trim(StringWrite('(es12.4)',this%cumulative_time)) // ' seconds'
+  call PrintMsg(this%option)
+
+  if (associated(this%timestepper)) then
+    call this%timestepper%FinalizeRun(this%option)
+  endif
+
+  if (associated(this%pm_list)) then
+    call this%pm_list%FinalizeRun()
+  endif
+
+  if (associated(this%child)) then
+    call this%child%FinalizeRun()
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%FinalizeRun()
+  endif
+
+end subroutine PMCBaseFinalizeRun
+
+! ************************************************************************** !
+
+subroutine SetOutputFlags(this)
+  !
+  ! Toggles flags that determine whether output is printed
+  ! to the screen and output file during a time step.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/29/13
+  !
+
+  use Option_module
+  use Output_Aux_module
+  use Print_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+  type(output_option_type), pointer :: output_option
+
+  output_option => this%pm_list%output_option
+
+  if (this%option%driver%print_flags%print_to_screen .and. &
+      output_option%screen_imod > 0) then
+    if (mod(this%timestepper%steps,output_option%screen_imod) == 0) then
+      call PrintSetPrintToScreenFlag(this%option%print_flags,PETSC_TRUE)
+    else
+      call PrintSetPrintToScreenFlag(this%option%print_flags,PETSC_FALSE)
+    endif
+  else
+    call PrintSetPrintToScreenFlag(this%option%print_flags,PETSC_FALSE)
+  endif
+
+  if (this%option%driver%print_flags%print_to_file .and. &
+      mod(this%timestepper%steps,output_option%output_file_imod) == 0) then
+    call PrintSetPrintToFileFlag(this%option%print_flags,PETSC_TRUE)
+  else
+    call PrintSetPrintToFileFlag(this%option%print_flags,PETSC_FALSE)
+  endif
+
+end subroutine SetOutputFlags
+
+! ************************************************************************** !
+
+recursive subroutine OutputLocal(this)
+  !
+  ! Finalizes the time stepping
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/18/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+  class(pm_base_type), pointer :: cur_pm
+
+#ifdef DEBUG
+  call PrintMsg(this%option,'PMC%Output()')
+#endif
+
+  cur_pm => this%pm_list
+  do
+    if (.not.associated(cur_pm)) exit
+!    call Output(cur_pm%realization,snapshot_plot_flag,observation_plot_flag, &
+!                massbal_plot_flag)
+    cur_pm => cur_pm%next
+  enddo
+
+end subroutine OutputLocal
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseCheckpoint(this,filename_append)
+  !
+  ! Checkpoints PMC timestepper and state variables.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 2/2/16
+  !
+  use hdf5
+  use Option_module
+  use Option_Checkpoint_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  character(len=MAXSTRINGLENGTH) :: filename_append
+
+  integer(HID_T) :: h5_chk_grp_id
+  PetscViewer :: viewer
+
+  if (this%option%checkpoint%format == CHECKPOINT_BINARY .or. &
+      this%option%checkpoint%format == CHECKPOINT_BOTH) then
+    call this%CheckpointBinary(viewer,filename_append)
+  endif
+  if (this%option%checkpoint%format == CHECKPOINT_HDF5 .or. &
+      this%option%checkpoint%format == CHECKPOINT_BOTH) then
+    call this%CheckpointHDF5(h5_chk_grp_id,filename_append)
+  endif
+
+end subroutine PMCBaseCheckpoint
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseCheckpointBinary(this,viewer,append_name)
+  !
+  ! Checkpoints PMC timestepper and state variables.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 07/26/13
+  !
+
+  use Logging_module
+  use Checkpoint_module, only : CheckpointOpenFileForWriteBinary, &
+                                CheckPointWriteCompatibilityBinary
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  PetscViewer :: viewer
+  character(len=MAXSTRINGLENGTH) :: append_name
+
+  class(pm_base_type), pointer :: cur_pm
+  class(pmc_base_header_type), pointer :: header
+  type(pmc_base_header_type) :: dummy_header
+  character(len=1),pointer :: dummy_char(:)
+  PetscBag :: bag
+  PetscSizeT :: bagsize
+  PetscLogDouble :: tstart, tend
+  PetscErrorCode :: ierr
+
+  bagsize = size(transfer(dummy_header,dummy_char))
+
+  ! if the top PMC
+  if (this%is_master) then
+    call PetscLogStagePush(logging%stage(OUTPUT_STAGE),ierr);CHKERRQ(ierr)
+    call PetscLogEventBegin(logging%event_checkpoint,ierr);CHKERRQ(ierr)
+    call PetscTime(tstart,ierr);CHKERRQ(ierr)
+    call CheckpointOpenFileForWriteBinary(viewer,append_name,this%option)
+    call CheckPointWriteCompatibilityBinary(viewer,this%option)
+    ! create header for storing local information specific to PMc
+    call PetscBagCreate(this%option%mycomm,bagsize,bag,ierr);CHKERRQ(ierr)
+    call PetscBagGetData(bag,header,ierr);CHKERRQ(ierr)
+    call PMCBaseRegisterHeader(this,bag,header)
+    call PMCBaseSetHeader(this,bag,header)
+    call PetscBagView(bag,viewer,ierr);CHKERRQ(ierr)
+    call PetscBagDestroy(bag,ierr);CHKERRQ(ierr)
+  endif
+
+  if (associated(this%timestepper)) then
+    call this%timestepper%CheckpointBinary(viewer,this%option)
+  endif
+
+  cur_pm => this%pm_list
+  do
+    if (.not.associated(cur_pm)) exit
+    call cur_pm%CheckpointBinary(viewer)
+    cur_pm => cur_pm%next
+  enddo
+
+  if (associated(this%child)) then
+    call this%child%CheckpointBinary(viewer,append_name)
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%CheckpointBinary(viewer,append_name)
+  endif
+
+  if (this%is_master) then
+    call PetscViewerDestroy(viewer,ierr);CHKERRQ(ierr)
+    viewer = PETSC_NULL_VIEWER
+    call PetscTime(tend,ierr);CHKERRQ(ierr)
+    write(this%option%io_buffer, &
+          '(6x,"Seconds to write to checkpoint file: ", f10.2)') &
+      tend-tstart
+    call PrintMsg(this%option)
+    call PetscLogEventEnd(logging%event_checkpoint,ierr);CHKERRQ(ierr)
+    call PetscLogStagePop(ierr);CHKERRQ(ierr)
+  endif
+
+end subroutine PMCBaseCheckpointBinary
+
+! ************************************************************************** !
+
+subroutine PMCBaseRegisterHeader(this,bag,header)
+  !
+  ! Register header entries.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 12/02/13
+  !
+
+  use Option_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  class(pmc_base_header_type) :: header
+  PetscBag :: bag
+
+  PetscErrorCode :: ierr
+
+  ! bagsize = 2 * 8 bytes = 16 bytes
+  call PetscBagRegisterInt(bag,header%plot_number,0,"plotnumber","", &
+                           ierr);CHKERRQ(ierr)
+  call PetscBagRegisterInt(bag,header%times_per_h5_file,0,"times_per_h5_file", &
+                           "",ierr);CHKERRQ(ierr)
+
+end subroutine PMCBaseRegisterHeader
+
+! ************************************************************************** !
+
+subroutine PMCBaseSetHeader(this,bag,header)
+  !
+  ! Sets values in checkpoint header.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 12/02/13
+  !
+
+  use Option_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  class(pmc_base_header_type) :: header
+  PetscBag :: bag
+
+  header%plot_number = &
+    this%pm_list%realization_base%output_option%plot_number
+
+  header%times_per_h5_file = &
+    this%pm_list%realization_base%output_option%times_per_h5_file
+
+end subroutine PMCBaseSetHeader
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseRestartBinary(this,viewer)
+  !
+  ! Restarts PMC timestepper and state variables.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 07/26/13
+  !
+  use Logging_module
+  use Checkpoint_module, only : CheckPointReadCompatibilityBinary
+
+  implicit none
+
+
+  class(pmc_base_type) :: this
+  PetscViewer :: viewer
+
+  class(pm_base_type), pointer :: cur_pm
+  class(pmc_base_header_type), pointer :: header
+  type(pmc_base_header_type) :: dummy_header
+  character(len=1),pointer :: dummy_char(:)
+  PetscBag :: bag
+  PetscSizeT :: bagsize
+  PetscLogDouble :: tstart, tend
+  PetscBool :: flag
+  PetscErrorCode :: ierr
+
+  bagsize = size(transfer(dummy_header,dummy_char))
+
+  ! if the top PMC,
+  if (this%is_master) then
+    call PetscTestFile(this%option%restart_filename,'r',flag, &
+                       ierr);CHKERRQ(ierr)
+    if (.not.flag) then
+      this%option%io_buffer = 'Restart file "' // &
+        trim(this%option%restart_filename) // '" not found.'
+      call PrintErrMsg(this%option)
+    endif
+    this%option%io_buffer = 'Restarting with checkpoint file "' // &
+      trim(this%option%restart_filename) // '".'
+    call PrintMsg(this%option)
+    call PetscLogEventBegin(logging%event_restart,ierr);CHKERRQ(ierr)
+    call PetscTime(tstart,ierr);CHKERRQ(ierr)
+    call PetscViewerBinaryOpen(this%option%mycomm, &
+                               this%option%restart_filename,FILE_MODE_READ, &
+                               viewer,ierr);CHKERRQ(ierr)
+    ! skip reading info file when loading, but not working
+    call PetscViewerBinarySetSkipOptions(viewer,PETSC_TRUE, &
+                                         ierr);CHKERRQ(ierr)
+    call CheckPointReadCompatibilityBinary(viewer,this%option)
+    ! read pmc header
+    call PetscBagCreate(this%option%mycomm,bagsize,bag,ierr);CHKERRQ(ierr)
+    call PetscBagGetData(bag,header,ierr);CHKERRQ(ierr)
+    call PMCBaseRegisterHeader(this,bag,header)
+    call PetscBagLoad(viewer,bag,ierr);CHKERRQ(ierr)
+    call PMCBaseGetHeader(this,header)
+    if (Initialized(this%option%restart_time)) then
+      this%pm_list%realization_base%output_option%plot_number = 0
+    endif
+    call PetscBagDestroy(bag,ierr);CHKERRQ(ierr)
+  endif
+
+  if (associated(this%timestepper)) then
+    call this%timestepper%RestartBinary(viewer,this%option)
+    if (Initialized(this%option%restart_time)) then
+      ! simply a flag to set time back to zero, no matter what the restart
+      ! time is set to.
+      call this%timestepper%Reset()
+      ! note that this sets the target time back to zero.
+    endif
+
+    ! Point cur_waypoint to the correct waypoint.
+    !geh: there is a problem here in that the timesteppers "prev_waypoint"
+    !     may not be set correctly if the time step does not converge. See
+    !     top of TimestepperBaseSetTargetTime().
+    call WaypointSkipToTime(this%timestepper%cur_waypoint, &
+                            this%timestepper%target_time)
+    !geh: this is a bit of a kludge.  Need to use the timestepper target time
+    !     directly.  Time is needed to update boundary conditions within
+    !     this%UpdateSolution
+    ! check to ensure that simulation is not restarted beyond the end of the
+    ! prescribed final simulation time.
+    if (.not.associated(this%timestepper%cur_waypoint)) then
+      write(this%option%io_buffer,*) this%timestepper%target_time* &
+        this%pm_list%realization_base%output_option%tconv
+      this%option%io_buffer = 'Simulation is being restarted at a time that &
+        &is at or beyond the end of checkpointed simulation (' // &
+        trim(adjustl(this%option%io_buffer)) // &
+        trim(this%pm_list%realization_base%output_option%tunit) // ').'
+      call PrintMsg(this%option)
+    endif
+    this%option%time = this%timestepper%target_time
+  endif
+
+  cur_pm => this%pm_list
+  do
+    if (.not.associated(cur_pm)) exit
+    if (cur_pm%skip_restart) then
+      this%option%io_buffer = 'Due to sequential nature of binary files, &
+        &skipping restart for binary formatted files is not allowed.'
+      call PrintErrMsg(this%option)
+    endif
+    call cur_pm%RestartBinary(viewer)
+    cur_pm => cur_pm%next
+  enddo
+
+  if (associated(this%child)) then
+    call this%child%RestartBinary(viewer)
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%RestartBinary(viewer)
+  endif
+
+  if (this%is_master) then
+    call PetscViewerDestroy(viewer,ierr);CHKERRQ(ierr)
+    call PetscTime(tend,ierr);CHKERRQ(ierr)
+    write(this%option%io_buffer, &
+          '("      Seconds to read from restart file: ", f10.2)') &
+      tend-tstart
+    call PrintMsg(this%option)
+    call PetscLogEventEnd(logging%event_restart,ierr);CHKERRQ(ierr)
+  endif
+
+end subroutine PMCBaseRestartBinary
+
+! ************************************************************************** !
+
+subroutine PMCBaseGetHeader(this,header)
+  !
+  ! Gets values in checkpoint header.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 12/02/13
+  !
+
+  use Option_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  class(pmc_base_header_type) :: header
+
+  character(len=MAXSTRINGLENGTH) :: string
+
+  this%pm_list%realization_base%output_option%plot_number = &
+    header%plot_number
+
+  ! Check the value of 'times_per_h5_file'
+  if (header%times_per_h5_file /= &
+      this%pm_list%realization_base%output_option%times_per_h5_file) then
+    write(string,*) header%times_per_h5_file
+    this%option%io_buffer = 'From checkpoint file: times_per_h5_file ' // trim(string)
+    call PrintMsg(this%option)
+    write(string,*) this%pm_list%realization_base%output_option%times_per_h5_file
+    this%option%io_buffer = 'From inputdeck      : times_per_h5_file ' // trim(string)
+    call PrintMsg(this%option)
+    this%option%io_buffer = 'times_per_h5_file specified in inputdeck does not ' // &
+      'match that stored in checkpoint file. Correct the inputdeck.'
+    call PrintErrMsg(this%option)
+  endif
+
+  this%pm_list%realization_base%output_option%times_per_h5_file = &
+    header%times_per_h5_file
+
+end subroutine PMCBaseGetHeader
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseCheckpointHDF5(this,h5_chk_grp_id,append_name)
+  !
+  ! Checkpoints PMC timestepper and state variables in HDF5 format.
+  !
+  ! Author: Gautam Bisht, LBNL
+  ! Date: 07/29/15
+  !
+  use Logging_module
+  use Checkpoint_module, only : CheckpointOpenFileForWriteHDF5, &
+                                CheckPointWriteCompatibilityHDF5
+  use hdf5
+  use HDF5_Aux_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  integer(HID_T) :: h5_chk_grp_id
+  character(len=MAXSTRINGLENGTH) :: append_name
+
+  integer(HID_T) :: h5_file_id
+  integer(HID_T) :: h5_pmc_grp_id
+  integer(HID_T) :: h5_pm_grp_id
+
+  class(pm_base_type), pointer :: cur_pm
+  type(pmc_base_header_type) :: dummy_header
+  character(len=1),pointer :: dummy_char(:)
+  PetscSizeT :: bagsize
+  PetscLogDouble :: tstart, tend
+  PetscErrorCode :: ierr
+
+  bagsize = size(transfer(dummy_header,dummy_char))
+
+  ! if the top PMC
+  if (this%is_master) then
+    call PetscLogStagePush(logging%stage(OUTPUT_STAGE),ierr);CHKERRQ(ierr)
+    call PetscLogEventBegin(logging%event_checkpoint,ierr);CHKERRQ(ierr)
+    call PetscTime(tstart,ierr);CHKERRQ(ierr)
+    call CheckpointOpenFileForWriteHDF5(h5_file_id, &
+                                        h5_chk_grp_id, &
+                                        append_name, this%option)
+    call CheckPointWriteCompatibilityHDF5(h5_chk_grp_id, &
+                                          this%option)
+    call HDF5GroupCreate(h5_chk_grp_id,trim(this%name),h5_pmc_grp_id, &
+                         this%option)
+    call PMCBaseSetHeaderHDF5(this, h5_pmc_grp_id, this%option)
+  else
+    call HDF5GroupCreate(h5_chk_grp_id,trim(this%name),h5_pmc_grp_id, &
+                         this%option)
+  endif
+
+  if (associated(this%timestepper)) then
+    call this%timestepper%CheckpointHDF5(h5_pmc_grp_id, this%option)
+  endif
+
+  cur_pm => this%pm_list
+  do
+    if (.not.associated(cur_pm)) exit
+    call HDF5GroupCreate(h5_pmc_grp_id,trim(cur_pm%name),h5_pm_grp_id, &
+                         this%option)
+    call cur_pm%CheckpointHDF5(h5_pm_grp_id)
+    call HDF5GroupClose(h5_pm_grp_id,this%option)
+
+    cur_pm => cur_pm%next
+  enddo
+
+  call HDF5GroupClose(h5_pmc_grp_id,this%option)
+
+  if (associated(this%child)) then
+    call this%child%CheckpointHDF5(h5_chk_grp_id,append_name)
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%CheckpointHDF5(h5_chk_grp_id,append_name)
+  endif
+
+  if (this%is_master) then
+    call HDF5GroupClose(h5_chk_grp_id,this%option)
+    call HDF5FileClose(h5_file_id,this%option)
+    call PetscTime(tend,ierr);CHKERRQ(ierr)
+    write(this%option%io_buffer, &
+          '("      Seconds to write to checkpoint file: ", f10.2)') &
+      tend-tstart
+    call PrintMsg(this%option)
+    call PetscLogEventEnd(logging%event_checkpoint,ierr);CHKERRQ(ierr)
+    call PetscLogStagePop(ierr);CHKERRQ(ierr)
+  endif
+
+end subroutine PMCBaseCheckpointHDF5
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseRestartHDF5(this,h5_chk_grp_id)
+  !
+  ! Restarts PMC timestepper and state variables from a HDF5
+  !
+  ! Author: Gautam Bisht, LBNL
+  ! Date: 08/09/15
+  !
+  use Logging_module
+  use hdf5
+  use HDF5_Aux_module
+  use Checkpoint_module, only : CheckPointReadCompatibilityHDF5, &
+                                CheckpointOpenFileForReadHDF5
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  integer(HID_T) :: h5_chk_grp_id
+
+  class(pm_base_type), pointer :: cur_pm
+  PetscLogDouble :: tstart, tend
+  PetscErrorCode :: ierr
+
+  integer(HID_T) :: h5_file_id
+  integer(HID_T) :: h5_pmc_grp_id
+  integer(HID_T) :: h5_pm_grp_id
+
+  PetscBool :: skip_restart
+
+  ! search pm for skip restart flag which will apply to everything in pmc
+  skip_restart = PETSC_FALSE
+  cur_pm => this%pm_list
+  do
+    if (.not.associated(cur_pm)) exit
+    if (cur_pm%skip_restart) then
+      skip_restart = PETSC_TRUE
+      exit
+    endif
+    cur_pm => cur_pm%next
+  enddo
+
+  ! if the top PMC
+  if (this%is_master) then
+    this%option%io_buffer = 'Restarting with checkpoint file "' // &
+      trim(this%option%restart_filename) // '".'
+    call PrintMsg(this%option)
+    call PetscLogEventBegin(logging%event_restart,ierr);CHKERRQ(ierr)
+    call PetscTime(tstart,ierr);CHKERRQ(ierr)
+
+    call CheckpointOpenFileForReadHDF5(this%option%restart_filename, &
+                                       h5_file_id, &
+                                       h5_chk_grp_id, &
+                                       this%option)
+
+    call CheckPointReadCompatibilityHDF5(h5_chk_grp_id, &
+                                         this%option)
+
+    if (.not.skip_restart) then
+      call HDF5GroupOpen(h5_chk_grp_id,this%name,h5_pmc_grp_id, &
+                         this%option)
+
+      ! read pmc header
+      call PMCBaseGetHeaderHDF5(this, h5_pmc_grp_id, this%option)
+    endif
+
+    if (Initialized(this%option%restart_time)) then
+      this%pm_list%realization_base%output_option%plot_number = 0
+    endif
+  else
+    if (.not.skip_restart) then
+      call HDF5GroupOpen(h5_chk_grp_id,this%name,h5_pmc_grp_id, &
+                         this%option)
+    endif
+  endif
+
+  if (associated(this%timestepper)) then
+    if (.not.skip_restart) then
+      call this%timestepper%RestartHDF5(h5_pmc_grp_id, this%option)
+    endif
+
+    if (Initialized(this%option%restart_time)) then
+      ! simply a flag to set time back to zero, no matter what the restart
+      ! time is set to.
+      call this%timestepper%Reset()
+      ! note that this sets the target time back to zero.
+    else if (skip_restart) then
+        this%option%io_buffer = 'Restarted simulations that SKIP_RESTART on &
+          &checkpointed process models must restart at time 0.'
+        call PrintErrMsg(this%option)
+    endif
+
+    ! Point cur_waypoint to the correct waypoint.
+    !geh: there is a problem here in that the timesteppers "prev_waypoint"
+    !     may not be set correctly if the time step does not converge. See
+    !     top of TimestepperBaseSetTargetTime().
+    call WaypointSkipToTime(this%timestepper%cur_waypoint, &
+                            this%timestepper%target_time)
+    !geh: this is a bit of a kludge.  Need to use the timestepper target time
+    !     directly.  Time is needed to update boundary conditions within
+    !     this%UpdateSolution
+    ! check to ensure that simulation is not restarted beyond the end of the
+    ! prescribed final simulation time.
+    if (.not.associated(this%timestepper%cur_waypoint)) then
+      write(this%option%io_buffer,*) this%timestepper%target_time/ &
+        this%pm_list%realization_base%output_option%tconv
+      this%option%io_buffer = 'Simulation is being restarted at a time that &
+        &is at or beyond the end of checkpointed simulation (' // &
+        trim(adjustl(this%option%io_buffer)) // &
+        trim(this%pm_list%realization_base%output_option%tunit) // ').'
+      call PrintErrMsg(this%option)
+    endif
+    this%option%time = this%timestepper%target_time
+  endif
+
+  if (.not.skip_restart) then
+    cur_pm => this%pm_list
+    do
+      if (.not.associated(cur_pm)) exit
+      call HDF5GroupOpen(h5_pmc_grp_id,cur_pm%name,h5_pm_grp_id, &
+                         this%option)
+      call cur_pm%RestartHDF5(h5_pm_grp_id)
+      call HDF5GroupClose(h5_pm_grp_id,this%option)
+      cur_pm => cur_pm%next
+    enddo
+
+    call HDF5GroupClose(h5_pmc_grp_id,this%option)
+  endif
+
+  if (associated(this%child)) then
+    call this%child%RestartHDF5(h5_chk_grp_id)
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%RestartHDF5(h5_chk_grp_id)
+  endif
+
+  if (this%is_master) then
+    call HDF5GroupClose(h5_chk_grp_id,this%option)
+    call HDF5FileClose(h5_file_id,this%option)
+    call PetscTime(tend,ierr);CHKERRQ(ierr)
+    write(this%option%io_buffer, &
+          '("      Seconds to read from restart file: ", f10.2)') &
+      tend-tstart
+    call PrintMsg(this%option)
+    call PetscLogEventEnd(logging%event_restart,ierr);CHKERRQ(ierr)
+  endif
+
+end subroutine PMCBaseRestartHDF5
+
+! ************************************************************************** !
+
+subroutine PMCBaseSetHeaderHDF5(this, h5_chk_grp_id, option)
+  !
+  ! Similar to PMCBaseSetHeader(), except this subroutine writes values in
+  ! a HDF5.
+  !
+  ! Author: Gautam Bisht, LBNL
+  ! Date: 07/30/15
+  !
+
+  use Option_module
+  use Checkpoint_module, only: CheckPointWriteIntDatasetHDF5
+  use hdf5
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  integer(HID_T) :: h5_chk_grp_id
+  type(option_type) :: option
+
+  integer(HSIZE_T), pointer :: dims(:)
+  integer(HSIZE_T), pointer :: start(:)
+  integer(HSIZE_T), pointer :: stride(:)
+  integer(HSIZE_T), pointer :: length(:)
+
+  PetscMPIInt :: dataset_rank
+  character(len=MAXSTRINGLENGTH) :: dataset_name
+  ! must be 'integer' so that ibuffer does not switch to 64-bit integers
+  ! when PETSc is configured with --with-64-bit-indices=yes.
+  integer, pointer :: int_array(:)
+
+  allocate(start(1))
+  allocate(dims(1))
+  allocate(length(1))
+  allocate(stride(1))
+  allocate(int_array(1))
+
+  dataset_rank = 1
+  dims(1) = ONE_INTEGER
+  start(1) = 0
+  length(1) = ONE_INTEGER
+  stride(1) = ONE_INTEGER
+
+  dataset_name = "Output_plot_number" // CHAR(0)
+  int_array(1) = this%pm_list%realization_base%output_option%plot_number
+  call CheckPointWriteIntDatasetHDF5(h5_chk_grp_id, &
+                                     dataset_name, dataset_rank, &
+                                     dims, start, length, stride, &
+                                     int_array, option)
+
+  dataset_name = "Output_times_per_h5_file" // CHAR(0)
+  int_array(1) = this%pm_list%realization_base%output_option%times_per_h5_file
+  call CheckPointWriteIntDatasetHDF5(h5_chk_grp_id, &
+                                     dataset_name, dataset_rank, &
+                                     dims, start, length, stride, &
+                                     int_array, option)
+
+  deallocate(start)
+  deallocate(dims)
+  deallocate(length)
+  deallocate(stride)
+  deallocate(int_array)
+
+end subroutine PMCBaseSetHeaderHDF5
+
+! ************************************************************************** !
+
+subroutine PMCBaseGetHeaderHDF5(this, h5_chk_grp_id, option)
+  !
+  ! Similar to PMCBaseGetHeader(), except this subroutine reads values from
+  ! a HDF5.
+  !
+  ! Author: Gautam Bisht, LBNL
+  ! Date: 08/16/15
+  !
+
+  use Option_module
+  use Checkpoint_module, only: CheckPointReadIntDatasetHDF5
+  use hdf5
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  integer(HID_T) :: h5_chk_grp_id
+  type(option_type) :: option
+
+  integer(HSIZE_T), pointer :: dims(:)
+  integer(HSIZE_T), pointer :: start(:)
+  integer(HSIZE_T), pointer :: stride(:)
+  integer(HSIZE_T), pointer :: length(:)
+
+  PetscMPIInt :: dataset_rank
+  character(len=MAXSTRINGLENGTH) :: dataset_name
+  ! must be 'integer' so that ibuffer does not switch to 64-bit integers
+  ! when PETSc is configured with --with-64-bit-indices=yes.
+  integer, pointer :: int_array(:)
+
+  allocate(start(1))
+  allocate(dims(1))
+  allocate(length(1))
+  allocate(stride(1))
+  allocate(int_array(1))
+
+  dataset_rank = 1
+  dims(1) = ONE_INTEGER
+  start(1) = 0
+  length(1) = ONE_INTEGER
+  stride(1) = ONE_INTEGER
+
+  dataset_name = "Output_plot_number" // CHAR(0)
+  call CheckPointReadIntDatasetHDF5(h5_chk_grp_id, dataset_name, dataset_rank, &
+                                    dims, start, length, stride, &
+                                    int_array, option)
+  this%pm_list%realization_base%output_option%plot_number = int_array(1)
+
+  dataset_name = "Output_times_per_h5_file" // CHAR(0)
+  call CheckPointReadIntDatasetHDF5(h5_chk_grp_id, dataset_name, dataset_rank, &
+                                    dims, start, length, stride, &
+                                    int_array, option)
+  this%pm_list%realization_base%output_option%times_per_h5_file = int_array(1)
+
+  deallocate(start)
+  deallocate(dims)
+  deallocate(length)
+  deallocate(stride)
+  deallocate(int_array)
+
+end subroutine PMCBaseGetHeaderHDF5
+
+! ************************************************************************** !
+
+subroutine AccumulateAuxData(this)
+  !
+  ! This routine
+  !
+  ! Author: Gautam Bisht,LBNL
+  ! Date: 08/21/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+end subroutine AccumulateAuxData
+
+! ************************************************************************** !
+
+subroutine GetAuxData(this)
+  !
+  ! This routine
+  !
+  ! Author: Gautam Bisht,LBNL
+  ! Date: 08/21/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+end subroutine GetAuxData
+
+! ************************************************************************** !
+
+subroutine SetAuxData(this)
+  !
+  ! This routine
+  !
+  ! Author: Gautam Bisht,LBNL
+  ! Date: 08/21/13
+  !
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+end subroutine SetAuxData
+
+! ************************************************************************** !
+
+subroutine PMCBaseUpdateMaterialProperties(this)
+  !
+  ! At a prescribed time, updates material properties based on instructions
+  ! provided by a material update waypoint.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 09/18/14
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+end subroutine PMCBaseUpdateMaterialProperties
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseCheckNullPM(this,option)
+  !
+  ! This routine
+  !
+  ! Author: Glenn Hammond
+  ! Date: 12/10/14
+  !
+  use Option_module
+
+  implicit none
+
+  class(pmc_base_type) :: this
+  type(option_type) :: option
+
+  if (.not.associated(this%pm_list)) then
+    option%io_buffer = 'Null PM in PMC "' // trim(this%name) // '".'
+    call PrintErrMsg(option)
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%CheckNullPM(option)
+  endif
+
+  if (associated(this%child)) then
+    call this%child%CheckNullPM(option)
+  endif
+
+end subroutine PMCBaseCheckNullPM
+
+! ************************************************************************** !
+
+subroutine PMCBaseStrip(this)
+  !
+  ! Deallocates members of PMC Base.
+  !
+  ! Author: Glenn Hammond
+  ! Date: 01/13/14
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+  ! these are destoyed elsewhere
+  nullify(this%option)
+  nullify(this%waypoint_list)
+
+  if (associated(this%timestepper)) then
+    call this%timestepper%Destroy()
+    ! destroy does not currently destroy; it strips
+    deallocate(this%timestepper)
+    nullify(this%timestepper)
+  endif
+  if (associated(this%pm_list)) then
+    ! destroy does not currently destroy; it strips
+    call this%pm_list%Destroy()
+    deallocate(this%pm_list)
+    nullify(this%pm_list)
+  endif
+  if (associated(this%pm_ptr)) then
+    nullify(this%pm_ptr%pm) ! solely a pointer
+    deallocate(this%pm_ptr)
+    nullify(this%pm_ptr)
+  endif
+  nullify(this%sim_aux)
+
+end subroutine PMCBaseStrip
+
+! ************************************************************************** !
+
+subroutine SetName(this, name)
+  !
+  ! Sets name
+  !
+  ! Author: Gautam Bisht
+  ! Date: 06/11/18
+  !
+  implicit none
+
+  class(pmc_base_type) :: this
+  character(len=*) :: name
+
+  this%name = name
+
+end subroutine SetName
+
+! ************************************************************************** !
+
+subroutine SetOption(this, option)
+  !
+  ! Sets option
+  !
+  ! Author: Gautam Bisht
+  ! Date: 06/11/18
+  !
+  implicit none
+
+  class(pmc_base_type) :: this
+  type(option_type), pointer :: option
+
+  if (associated(option)) this%option => option
+
+end subroutine SetOption
+
+! ************************************************************************** !
+
+subroutine SetWaypointList(this, waypoint_list)
+  !
+  ! Sets waypoint list
+  !
+  ! Author: Gautam Bisht
+  ! Date: 06/11/18
+  !
+  implicit none
+
+  class(pmc_base_type) :: this
+  type(waypoint_list_type), pointer :: waypoint_list
+
+  if (associated(waypoint_list)) this%waypoint_list => waypoint_list
+
+end subroutine SetWaypointList
+
+! ************************************************************************** !
+
+recursive subroutine PMCBaseDestroy(this)
+  !
+  ! Deallocates a pmc object
+  !
+  ! Author: Glenn Hammond
+  ! Date: 03/14/13
+  !
+
+  use Utility_module, only: DeallocateArray
+
+  implicit none
+
+  class(pmc_base_type) :: this
+
+#ifdef DEBUG
+  call PrintMsg(this%option,'PMC%Destroy()')
+#endif
+
+  if (associated(this%child)) then
+    call this%child%Destroy()
+    ! destroy does not currently destroy; it strips
+    deallocate(this%child)
+    nullify(this%child)
+  endif
+
+  if (associated(this%peer)) then
+    call this%peer%Destroy()
+    ! destroy does not currently destroy; it strips
+    deallocate(this%peer)
+    nullify(this%peer)
+  endif
+
+!  deallocate(pmc)
+!  nullify(pmc)
+
+end subroutine PMCBaseDestroy
+
+end module PMC_Base_class

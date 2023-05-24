@@ -1,0 +1,70 @@
+# Problem contributed by Aitor Iraola (aitor.iraola@amphos21.com)
+
+SIMULATION
+  SIMULATION_TYPE SUBSURFACE
+  PROCESS_MODELS
+    SUBSURFACE_FLOW flow
+      MODE RICHARDS
+    /
+  /
+END
+
+SUBSURFACE
+
+EXTERNAL_FILE ugrid.txt
+
+#=========================== regression =======================================
+REGRESSION
+  CELLS_PER_PROCESS 4
+END
+
+#=========================== flow conditions ==================================
+FLOW_CONDITION initial
+  TYPE
+    LIQUID_PRESSURE HYDROSTATIC
+  /
+  LIQUID_PRESSURE 101293
+  DATUM 0.d0 0.d0 0.0d0
+END
+
+FLOW_CONDITION ConditionA
+  TYPE
+    LIQUID_PRESSURE Dirichlet
+  /
+  LIQUID_PRESSURE 101293
+/
+FLOW_CONDITION ConditionB
+  TYPE
+    LIQUID_PRESSURE Dirichlet
+  /
+  LIQUID_PRESSURE 101293
+/
+
+#=========================== condition couplers ===============================
+# default initial condition
+INITIAL_CONDITION
+  FLOW_CONDITION initial
+  REGION all
+END
+
+INITIAL_CONDITION ConditionB
+  FLOW_CONDITION ConditionB
+  REGION ConditionB
+END
+
+INITIAL_CONDITION ConditionA
+  FLOW_CONDITION ConditionA
+  REGION ConditionA
+END
+
+BOUNDARY_CONDITION ConditionA
+  FLOW_CONDITION ConditionA
+  REGION ConditionA
+END
+
+BOUNDARY_CONDITION ConditionB
+  FLOW_CONDITION ConditionB
+  REGION ConditionB
+END
+
+END_SUBSURFACE

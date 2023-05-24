@@ -1,0 +1,23 @@
+#Description: 10-cell flow and carbonate transport problem for verifying checkpoint/restart with skips
+
+SIMULATION
+  SIMULATION_TYPE SUBSURFACE
+  PROCESS_MODELS
+    SUBSURFACE_FLOW flow
+      MODE GENERAL
+      OPTIONS
+        SKIP_RESTART
+      /
+    /
+    SUBSURFACE_TRANSPORT transport
+      MODE GIRT
+    /
+  /
+  RESTART
+    FILENAME general_base-restart.h5
+    RESET_TO_TIME_ZERO
+  END
+END
+
+EXTERNAL_FILE subsurface_block.txt
+

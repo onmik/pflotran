@@ -1,0 +1,19 @@
+#=========================== flow conditions ==================================
+FLOW_CONDITION initial
+  TYPE
+    LIQUID_PRESSURE DIRICHLET
+    TEMPERATURE DIRICHLET
+  /
+  LIQUID_PRESSURE 1.d4
+  TEMPERATURE 25.d0
+/
+
+FLOW_CONDITION upwind_corner
+  TYPE
+    LIQUID_PRESSURE DIRICHLET
+    TEMPERATURE DIRICHLET
+  /
+  LIQUID_PRESSURE 1.d6
+  TEMPERATURE 15.d0
+/
+
