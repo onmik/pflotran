@@ -2734,6 +2734,7 @@ reaction_sandbox.o : \
   reaction_sandbox_chromium.o \
   reaction_sandbox_clm_cn.o \
   reaction_sandbox_equilibrate.o \
+  reaction_sandbox_eos.o \
   reaction_sandbox_example.o \
   reaction_sandbox_flexbiohill.o \
   reaction_sandbox_gas.o \
@@ -2815,6 +2816,17 @@ reaction_sandbox_clm_cn.o : \
   units.o \
   utility.o
 reaction_sandbox_equilibrate.o : \
+  global_aux.o \
+  input_aux.o \
+  material_aux.o \
+  option.o \
+  pflotran_constants.o \
+  reaction_aux.o \
+  reaction_sandbox_base.o \
+  reactive_transport_aux.o \
+  string.o \
+  units.o
+reaction_sandbox_eos.o : \
   global_aux.o \
   input_aux.o \
   material_aux.o \
