@@ -26,10 +26,9 @@ module Reaction_Sandbox_EOS_class
   type, public, &
     extends(reaction_sandbox_base_type) :: reaction_sandbox_EOS_type
 ! 3. Add variables/arrays associated with new reaction.
-    character(len=MAXWORDLENGTH) :: species_name, mineral_name
-    PetscInt :: species_id
-    PetscInt :: species_im_id
-    PetscReal :: rate_constant
+    character(len=MAXWORDLENGTH) :: mobile_name, immobile_name, scaling_mineral_name
+    PetscInt :: species_id, species_im_id, scaling_mineral_id
+    PetscReal :: diffusion_rate
   contains
     procedure, public :: ReadInput => EOSRead
     procedure, public :: Setup => EOSSetup
@@ -55,10 +54,11 @@ function EOSCreate()
 ! 4. Add code to allocate the object, initialize all variables to zero and
 !    nullify all pointers. E.g.,
   allocate(EOSCreate)
-  EOSCreate%species_name = ''
-  EOSCreate%mineral_name = ''
+  EOSCreate%mobile_name = ''
+  EOSCreate%immobile_name = ''
   EOSCreate%species_id = 0
-  EOSCreate%rate_constant = 0.d0
+  !EOSCreate%rate_immobile = 0.d0
+  EOSCreate%diffusion_rate = 0.d0
   nullify(EOSCreate%next)
 
 end function EOSCreate
@@ -82,7 +82,9 @@ subroutine EOSRead(this,input,option)
   type(option_type) :: option
 
   character(len=MAXWORDLENGTH) :: word, internal_units
-
+  character(len=MAXWORDLENGTH) :: error_string
+  error_string = 'CHEMISTRY,RXN_SANDBOX,LAMBDA'
+  
   call InputPushBlock(input,option)
   do
     call InputReadPflotranString(input,option)
@@ -90,8 +92,7 @@ subroutine EOSRead(this,input,option)
     if (InputCheckExit(input,option)) exit
 
     call InputReadCard(input,option,word)
-    call InputErrorMsg(input,option,'keyword', &
-                       'CHEMISTRY,REACTION_SANDBOX,EOS')
+    call InputErrorMsg(input,option,'keyword', trim(error_string))
     call StringToUpper(word)
 
     select case(trim(word))
@@ -112,31 +113,45 @@ subroutine EOSRead(this,input,option)
       ! END
 
 ! 5. Add a case statement for reading variables.
-      case('SPECIES_NAME')
-        call InputReadWord(input,option,this%species_name,PETSC_TRUE)
-        call InputErrorMsg(input,option,'SPECIES_NAME', &
-                           'CHEMISTRY,REACTION_SANDBOX,EOS')
-      case('MINERAL_NAME')
-        call InputReadWord(input,option,this%mineral_name,PETSC_TRUE)
-        call InputErrorMsg(input,option,'MINERAL_NAME', &
+      case('MOBILE_NAME')
+        call InputReadWord(input,option,this%mobile_name,PETSC_TRUE)
+        call InputErrorMsg(input,option,'mobile_name', trim(error_string))
+      case('IMMOBILE_NAME')
+        call InputReadWord(input,option,this%immobile_name,PETSC_TRUE)
+        call InputErrorMsg(input,option,'IMMOBILE_NAME', &
                            'CHEMISTRY,REACTION_SANDBOX,EOS')
 ! 8. Repeat for other variables.
-       case('RATE_CONSTANT')
+!       case('RATE_IMMOBILE')
 !         ! Read the double precision rate constant.
-         call InputReadDouble(input,option,this%rate_constant)
+!         call InputReadDouble(input,option,this%rate_immobile)
 !         ! Note the use of character variable 'word' instead of 'RATE_CONSTANT'
 !         ! in the error message, as they are identical.
-         call InputErrorMsg(input,option,word, &
-                            'CHEMISTRY,REACTION_SANDBOX,EOS')
+!         call InputErrorMsg(input,option,word, &
+!                            'CHEMISTRY,REACTION_SANDBOX,EOS')
+!         ! Read the optional units and convert to internal
+!         ! units of 1/s.
+!         internal_units = 'unitless/sec'
+!         call InputReadAndConvertUnits(input,this%rate_immobile, &
+!                                 internal_units,'CHEMISTRY,REACTION_SANDBOX,&
+!                                 &EOS,RATE_IMMOBILE',option)
+
+      case('SCALING_MINERAL')
+        call InputReadWord(input,option,this%scaling_mineral_name,PETSC_TRUE)
+        call InputErrorMsg(input,option,word, trim(error_string))
+        
+      case('DIFFUSION_RATE')
+!         ! Read the double precision rate constant.
+        call InputReadDouble(input,option,this%diffusion_rate)
+!         ! Note the use of character variable 'word' instead of 'RATE_CONSTANT'
+!         ! in the error message, as they are identical.
+        call InputErrorMsg(input,option,word, trim(error_string))
 !         ! Read the optional units and convert to internal
 !         ! units of 1/s.
          internal_units = 'unitless/sec'
-         call InputReadAndConvertUnits(input,this%rate_constant, &
-                                 internal_units,'CHEMISTRY,REACTION_SANDBOX,&
-                                 &EOS,RATE_CONSTANT',option)
+        call InputReadAndConvertUnits(input,this%diffusion_rate, &
+                                 internal_units, trim(error_string), option)
       case default
-        call InputKeywordUnrecognized(input,word, &
-                     'CHEMISTRY,REACTION_SANDBOX,EOS',option)
+        call InputKeywordUnrecognized(input,word, trim(error_string),option)
     end select
   enddo
   call InputPopBlock(input,option)
@@ -155,6 +170,7 @@ subroutine EOSSetup(this,reaction,option)
   !
   use Reaction_Aux_module, only : reaction_rt_type, GetPrimarySpeciesIDFromName
   use Reaction_Immobile_Aux_module, only : GetImmobileSpeciesIDFromName
+  use Reaction_Mineral_Aux_module, only: GetKineticMineralIDFromName
   use Option_module
 
   implicit none
@@ -165,9 +181,11 @@ subroutine EOSSetup(this,reaction,option)
 
 ! 9. Add code to initialize.
   this%species_id = &
-    GetPrimarySpeciesIDFromName(this%species_name,reaction,option)
+    GetPrimarySpeciesIDFromName(this%mobile_name, reaction, option)
   this%species_im_id = &
-    GetImmobileSpeciesIDFromName(this%mineral_name,reaction%immobile,option)  
+    GetImmobileSpeciesIDFromName(this%immobile_name, reaction%immobile, option)  
+  this%scaling_mineral_id = &
+    GetKineticMineralIDFromName(this%scaling_mineral_name, reaction%mineral, option)
 
 end subroutine EOSSetup
 
@@ -201,7 +219,7 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
 
   PetscInt, parameter :: iphase = 1
   PetscInt :: idof_immobile, idof_mobile
-  PetscReal :: L_water, flux_to_aq
+  PetscReal :: L_water, flux_to_aq, rate
 
   ! Description of subroutine arguments:
 
@@ -251,7 +269,7 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
   ! reaction - Provides access to variable describing chemistry.  E.g.,
   !   reaction%ncomp - # chemical degrees of freedom (mobile and immobile)
   !   reaction%naqcomp - # chemical degrees of freedom on water
-  !   reaction%primary_species_names(:) - names of primary species
+  !   reaction%primary_mobile_names(:) - names of primary species
   !
   ! option - Provides handle for controlling simulation, catching and
   !          reporting errors.
@@ -260,16 +278,18 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
 
   ! Units of the Residual must be in moles/second.
   ! 1.d3 converts m^3 water -> L water
-  L_water = material_auxvar%porosity*global_auxvar%sat(iphase)* &
-         material_auxvar%volume*1.d3
-         
+  !L_water = material_auxvar%porosity*global_auxvar%sat(iphase)* &
+  !       material_auxvar%volume*1.d3
+  L_water = material_auxvar%porosity*global_auxvar%sat(iphase)*1.d3
+  rate = this%diffusion_rate * rt_auxvar%mnrl_volfrac(this%scaling_mineral_id)
+  
   idof_mobile = this%species_id
   idof_immobile = this%species_im_id + reaction%offset_immobile
-  !flux_to_aq = (this%rate_constant) * ( rt_auxvar%immobile(this%species_im_id) - rt_auxvar%total(this%species_id,iphase) ) 
+  flux_to_aq = rate * ( rt_auxvar%immobile(this%species_im_id) - rt_auxvar%total(this%species_id,iphase) ) 
   !* material_auxvar%volume 
   ! Always "subtract" the contribution from the Residual.
-  Residual(idof_mobile) = Residual(idof_mobile) - this%rate_constant * L_water ! * rt_auxvar%total(this%species_id,iphase)
-  Residual(idof_immobile) = Residual(idof_immobile) + this%rate_constant * L_water
+  Residual(idof_mobile) = Residual(idof_mobile) - flux_to_aq * L_water * material_auxvar%volume ! * rt_auxvar%total(this%species_id,iphase)
+  Residual(idof_immobile) = Residual(idof_immobile) + flux_to_aq * material_auxvar%volume
 
   !this%rate_D_m* &                   ! 1/s
   !                         rt_auxvar%immobile(this%D_immobile_id)* &           ! mol/m3 bulk
