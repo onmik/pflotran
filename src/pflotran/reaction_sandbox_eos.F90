@@ -304,10 +304,10 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
     ! Always "add" the contribution to the Jacobian.
     ! Units = (mol/sec)*(kg water/mol) = kg water/sec
     
-    Jacobian(idof_mobile, idof_mobile) =   Jacobian(idof_mobile, idof_mobile) - rate * L_water * material_auxvar%volume
-    Jacobian(idof_mobile, idof_immobile) =   Jacobian(idof_mobile, idof_immobile) + rate * L_water * material_auxvar%volume
-    Jacobian(idof_immobile, idof_mobile) =   Jacobian(idof_immobile, idof_mobile) + rate * material_auxvar%volume
-    Jacobian(idof_immobile, idof_immobile) =   Jacobian(idof_immobile, idof_immobile) - rate * material_auxvar%volume
+    Jacobian(idof_mobile, idof_mobile) =   Jacobian(idof_mobile, idof_mobile) + rate * L_water * material_auxvar%volume
+    Jacobian(idof_mobile, idof_immobile) =   Jacobian(idof_mobile, idof_immobile) - rate * L_water * material_auxvar%volume
+    Jacobian(idof_immobile, idof_mobile) =   Jacobian(idof_immobile, idof_mobile) - rate * material_auxvar%volume
+    Jacobian(idof_immobile, idof_immobile) =   Jacobian(idof_immobile, idof_immobile) + rate * material_auxvar%volume
   
   !    (-2.d0) * & ! negative stoichiometry
       ! rt_auxvar%aqueous%dtotal(this%species_id,this%species_id,iphase) =
