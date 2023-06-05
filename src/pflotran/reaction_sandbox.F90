@@ -8,6 +8,7 @@ module Reaction_Sandbox_module
   use Reaction_Sandbox_CLM_CN_class
   use Reaction_Sandbox_UFD_WP_class
   use Reaction_Sandbox_Example_class
+  use Reaction_Sandbox_EOS_class
   use Reaction_Sand_Equilibrate_class
   use Reaction_Sandbox_Simple_class
   use Reaction_Sandbox_Chromium_class
@@ -175,6 +176,8 @@ subroutine RSandboxRead2(local_sandbox_list,input,option)
         new_sandbox => CyberCreate()
       case('EXAMPLE')
         new_sandbox => EXAMPLECreate()
+      case('EOS')
+        new_sandbox => EOSCreate()
       case('EQUILIBRATE')
         new_sandbox => EquilibrateCreate()
       case('FLEXIBLE_BIODEGRADATION_HILL')
