@@ -1,9 +1,19 @@
-module Reaction_Sandbox_EOS_class
+module Reaction_Sandbox_DWP_class
+! Distributed Waste Package 
+! equations (considering same units):
+!
+! flux_to_mobile = diffusion_rate * ( conc_waste_package - conc_mobile ) 
+! waste_decay = decay_rate * conc_waste_package
+! conc_mobile += flux_to_mobile
+! conc_waste_package -= flux_to_mobile + decay_halflife
+!
+! - different scaling has to be applied to the mobaile and immobile contribution in order to have mass conservation (without decay)
+! - both `diffusion_rate` and `decay rate` could be space dependent using auxiliary minerals
 
 #include "petsc/finclude/petscsys.h"
   use petscsys
 
-! 1. Change all references to "EOS" as desired to rename the module and
+! 1. Change all references to "DWP" as desired to rename the module and
 !    and subroutines within the module.
 
   use Reaction_Sandbox_Base_class
@@ -24,50 +34,50 @@ module Reaction_Sandbox_EOS_class
 ! PetscReal, parameter :: formula_weight_of_water = 18.01534d0
 
   type, public, &
-    extends(reaction_sandbox_base_type) :: reaction_sandbox_EOS_type
+    extends(reaction_sandbox_base_type) :: reaction_sandbox_DWP_type
 ! 3. Add variables/arrays associated with new reaction.
-    character(len=MAXWORDLENGTH) :: mobile_name, immobile_name, scaling_mineral_name
-    PetscInt :: species_id, species_im_id, scaling_mineral_id
-    PetscReal :: diffusion_rate
+    character(len=MAXWORDLENGTH) :: mobile_name, immobile_name, diffusion_scaling_mineral_name, decay_scaling_mineral_name
+    PetscInt :: species_id, species_im_id, diffusion_scaling_mineral_id, decay_scaling_mineral_id
+    PetscReal :: diffusion_rate, decay_rate
   contains
-    procedure, public :: ReadInput => EOSRead
-    procedure, public :: Setup => EOSSetup
-    procedure, public :: Evaluate => EOSEvaluate
-    procedure, public :: Destroy => EOSDestroy
-  end type reaction_sandbox_EOS_type
+    procedure, public :: ReadInput => DWPRead
+    procedure, public :: Setup => DWPSetup
+    procedure, public :: Evaluate => DWPEvaluate
+    procedure, public :: Destroy => DWPDestroy
+  end type reaction_sandbox_DWP_type
 
-  public :: EOSCreate
+  public :: DWPCreate
 
 contains
 
 ! ************************************************************************** !
 
-function EOSCreate()
+function DWPCreate()
   !
-  ! Allocates EOS reaction object.
+  ! Allocates DWP reaction object.
   !
 
   implicit none
 
-  class(reaction_sandbox_EOS_type), pointer :: EOSCreate
+  class(reaction_sandbox_DWP_type), pointer :: DWPCreate
 
 ! 4. Add code to allocate the object, initialize all variables to zero and
 !    nullify all pointers. E.g.,
-  allocate(EOSCreate)
-  EOSCreate%mobile_name = ''
-  EOSCreate%immobile_name = ''
-  EOSCreate%species_id = 0
-  !EOSCreate%rate_immobile = 0.d0
-  EOSCreate%diffusion_rate = 0.d0
-  nullify(EOSCreate%next)
+  allocate(DWPCreate)
+  DWPCreate%mobile_name = ''
+  DWPCreate%immobile_name = ''
+  DWPCreate%species_id = 0
+  !DWPCreate%rate_immobile = 0.d0
+  DWPCreate%diffusion_rate = 0.d0
+  nullify(DWPCreate%next)
 
-end function EOSCreate
+end function DWPCreate
 
 ! ************************************************************************** !
 
-subroutine EOSRead(this,input,option)
+subroutine DWPRead(this,input,option)
   !
-  ! Reads input deck for EOS reaction parameters (if any)
+  ! Reads input deck for DWP reaction parameters (if any)
   !
 
   use Option_module
@@ -77,13 +87,13 @@ subroutine EOSRead(this,input,option)
 
   implicit none
 
-  class(reaction_sandbox_EOS_type) :: this
+  class(reaction_sandbox_DWP_type) :: this
   type(input_type), pointer :: input
   type(option_type) :: option
 
   character(len=MAXWORDLENGTH) :: word, internal_units
   character(len=MAXWORDLENGTH) :: error_string
-  error_string = 'CHEMISTRY,RXN_SANDBOX,LAMBDA'
+  error_string = 'CHEMISTRY,REACTION_SANDBOX,DISTRIBUTED_WASTE_PACKAGE'
   
   call InputPushBlock(input,option)
   do
@@ -97,15 +107,15 @@ subroutine EOSRead(this,input,option)
 
     select case(trim(word))
 
-      ! EOS Input:
+      ! DWP Input:
 
       ! CHEMISTRY
       !   ...
       !   REACTION_SANDBOX
       !     # begin user-defined input
-      !     EOS
-      !       EOS_INTEGER 1
-      !       EOS_INTEGER_ARRAY 2 3 4
+      !     DWP
+      !       DWP_INTEGER 1
+      !       DWP_INTEGER_ARRAY 2 3 4
       !     END
       !     # end user defined input
       !   END
@@ -118,8 +128,7 @@ subroutine EOSRead(this,input,option)
         call InputErrorMsg(input,option,'mobile_name', trim(error_string))
       case('IMMOBILE_NAME')
         call InputReadWord(input,option,this%immobile_name,PETSC_TRUE)
-        call InputErrorMsg(input,option,'IMMOBILE_NAME', &
-                           'CHEMISTRY,REACTION_SANDBOX,EOS')
+        call InputErrorMsg(input,option,'IMMOBILE_NAME', trim(error_string))
 ! 8. Repeat for other variables.
 !       case('RATE_IMMOBILE')
 !         ! Read the double precision rate constant.
@@ -127,42 +136,47 @@ subroutine EOSRead(this,input,option)
 !         ! Note the use of character variable 'word' instead of 'RATE_CONSTANT'
 !         ! in the error message, as they are identical.
 !         call InputErrorMsg(input,option,word, &
-!                            'CHEMISTRY,REACTION_SANDBOX,EOS')
+!                            'CHEMISTRY,REACTION_SANDBOX,DWP')
 !         ! Read the optional units and convert to internal
 !         ! units of 1/s.
 !         internal_units = 'unitless/sec'
 !         call InputReadAndConvertUnits(input,this%rate_immobile, &
 !                                 internal_units,'CHEMISTRY,REACTION_SANDBOX,&
-!                                 &EOS,RATE_IMMOBILE',option)
+!                                 &DWP,RATE_IMMOBILE',option)
 
-      case('SCALING_MINERAL')
-        call InputReadWord(input,option,this%scaling_mineral_name,PETSC_TRUE)
+      case('DIFFUSION_SCALE_MINERAL')
+        call InputReadWord(input,option,this%diffusion_scaling_mineral_name,PETSC_TRUE)
+        call InputErrorMsg(input,option,word, trim(error_string))
+      case('DECAY_SCALE_MINERAL')
+        call InputReadWord(input,option,this%decay_scaling_mineral_name,PETSC_TRUE)
         call InputErrorMsg(input,option,word, trim(error_string))
         
       case('DIFFUSION_RATE')
-!         ! Read the double precision rate constant.
         call InputReadDouble(input,option,this%diffusion_rate)
-!         ! Note the use of character variable 'word' instead of 'RATE_CONSTANT'
-!         ! in the error message, as they are identical.
         call InputErrorMsg(input,option,word, trim(error_string))
-!         ! Read the optional units and convert to internal
-!         ! units of 1/s.
-         internal_units = 'unitless/sec'
+        internal_units = 'unitless/sec'
         call InputReadAndConvertUnits(input,this%diffusion_rate, &
                                  internal_units, trim(error_string), option)
-      case default
+      case('DECAY_RATE')
+        call InputReadDouble(input,option,this%decay_rate)
+        call InputErrorMsg(input,option,word, trim(error_string))
+        internal_units = 'unitless/sec'
+        call InputReadAndConvertUnits(input,this%decay_rate, &
+                                 internal_units, trim(error_string), option)
+
+    case default
         call InputKeywordUnrecognized(input,word, trim(error_string),option)
     end select
   enddo
   call InputPopBlock(input,option)
 
-end subroutine EOSRead
+end subroutine DWPRead
 
 ! ************************************************************************** !
 
-subroutine EOSSetup(this,reaction,option)
+subroutine DWPSetup(this,reaction,option)
   !
-  ! Sets up the EOS reaction with parameters either read from the
+  ! Sets up the DWP reaction with parameters either read from the
   ! input deck or hardwired.
   !
   ! Author: John Doe
@@ -175,7 +189,7 @@ subroutine EOSSetup(this,reaction,option)
 
   implicit none
 
-  class(reaction_sandbox_EOS_type) :: this
+  class(reaction_sandbox_DWP_type) :: this
   class(reaction_rt_type) :: reaction
   type(option_type) :: option
 
@@ -184,14 +198,16 @@ subroutine EOSSetup(this,reaction,option)
     GetPrimarySpeciesIDFromName(this%mobile_name, reaction, option)
   this%species_im_id = &
     GetImmobileSpeciesIDFromName(this%immobile_name, reaction%immobile, option)  
-  this%scaling_mineral_id = &
-    GetKineticMineralIDFromName(this%scaling_mineral_name, reaction%mineral, option)
+  this%diffusion_scaling_mineral_id = &
+    GetKineticMineralIDFromName(this%diffusion_scaling_mineral_name, reaction%mineral, option)
+  this%decay_scaling_mineral_id = &
+    GetKineticMineralIDFromName(this%decay_scaling_mineral_name, reaction%mineral, option)
 
-end subroutine EOSSetup
+end subroutine DWPSetup
 
 ! ************************************************************************** !
 
-subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
+subroutine DWPEvaluate(this,Residual,Jacobian,compute_derivative, &
                            rt_auxvar,global_auxvar,material_auxvar, &
                            reaction,option)
   !
@@ -206,7 +222,7 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
 
   implicit none
 
-  class(reaction_sandbox_EOS_type) :: this
+  class(reaction_sandbox_DWP_type) :: this
   type(option_type) :: option
   class(reaction_rt_type) :: reaction
   PetscBool :: compute_derivative
@@ -219,7 +235,7 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
 
   PetscInt, parameter :: iphase = 1
   PetscInt :: idof_immobile, idof_mobile
-  PetscReal :: L_water, flux_to_aq, rate
+  PetscReal :: L_water, flux_to_aq, rate, decay_rate, decay_flux
 
   ! Description of subroutine arguments:
 
@@ -239,7 +255,7 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
   !   if (compute_derivative) then
   !     option%io_buffer = 'NUMERICAL_JACOBIAN must be specified within &
   !       &the NEWTON_SOLVER block of NUMERICAL_METHODS TRANSPORT due to &
-  !       &assumptions made in EOSEvaluate.'
+  !       &assumptions made in DWPEvaluate.'
   !     call PrintErrMsg(option)
   !   endif
   !
@@ -281,15 +297,18 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
   !L_water = material_auxvar%porosity*global_auxvar%sat(iphase)* &
   !       material_auxvar%volume*1.d3
   L_water = material_auxvar%porosity*global_auxvar%sat(iphase)*1.d3
-  rate = this%diffusion_rate * rt_auxvar%mnrl_volfrac(this%scaling_mineral_id)
+  rate = this%diffusion_rate * rt_auxvar%mnrl_volfrac(this%diffusion_scaling_mineral_id)
+  decay_rate = this%decay_rate * rt_auxvar%mnrl_volfrac(this%decay_scaling_mineral_id)
   
   idof_mobile = this%species_id
   idof_immobile = this%species_im_id + reaction%offset_immobile
   flux_to_aq = rate * ( rt_auxvar%immobile(this%species_im_id) - rt_auxvar%total(this%species_id,iphase) ) 
+  decay_flux = decay_rate * rt_auxvar%immobile(this%species_im_id) 
+  
   !* material_auxvar%volume 
   ! Always "subtract" the contribution from the Residual.
   Residual(idof_mobile) = Residual(idof_mobile) - flux_to_aq * L_water * material_auxvar%volume ! * rt_auxvar%total(this%species_id,iphase)
-  Residual(idof_immobile) = Residual(idof_immobile) + flux_to_aq * material_auxvar%volume
+  Residual(idof_immobile) = Residual(idof_immobile) + (flux_to_aq + decay_flux) * material_auxvar%volume
 
   !this%rate_D_m* &                   ! 1/s
   !                         rt_auxvar%immobile(this%D_immobile_id)* &           ! mol/m3 bulk
@@ -307,7 +326,7 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
     Jacobian(idof_mobile, idof_mobile) =   Jacobian(idof_mobile, idof_mobile) + rate * L_water * material_auxvar%volume
     Jacobian(idof_mobile, idof_immobile) =   Jacobian(idof_mobile, idof_immobile) - rate * L_water * material_auxvar%volume
     Jacobian(idof_immobile, idof_mobile) =   Jacobian(idof_immobile, idof_mobile) - rate * material_auxvar%volume
-    Jacobian(idof_immobile, idof_immobile) =   Jacobian(idof_immobile, idof_immobile) + rate * material_auxvar%volume
+    Jacobian(idof_immobile, idof_immobile) =   Jacobian(idof_immobile, idof_immobile) + (rate + decay_rate) * material_auxvar%volume
   
   !    (-2.d0) * & ! negative stoichiometry
       ! rt_auxvar%aqueous%dtotal(this%species_id,this%species_id,iphase) =
@@ -347,11 +366,11 @@ subroutine EOSEvaluate(this,Residual,Jacobian,compute_derivative, &
 
   !endif
   
-end subroutine EOSEvaluate
+end subroutine DWPEvaluate
 
 ! ************************************************************************** !
 
-subroutine EOSDestroy(this)
+subroutine DWPDestroy(this)
   !
   ! Destroys allocatable or pointer objects created in this module
   !
@@ -360,10 +379,10 @@ subroutine EOSDestroy(this)
   !
   implicit none
 
-  class(reaction_sandbox_EOS_type) :: this
+  class(reaction_sandbox_DWP_type) :: this
 
-! 12. Add code to deallocate dynamic members of reaction_sandbox_EOS_type.
+! 12. Add code to deallocate dynamic members of reaction_sandbox_DWP_type.
 
-end subroutine EOSDestroy
+end subroutine DWPDestroy
 
-end module Reaction_Sandbox_EOS_class
+end module Reaction_Sandbox_DWP_class
