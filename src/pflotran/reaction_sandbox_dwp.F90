@@ -36,13 +36,19 @@ module Reaction_Sandbox_DWP_class
   type, public, &
     extends(reaction_sandbox_base_type) :: reaction_sandbox_DWP_type
 ! 3. Add variables/arrays associated with new reaction.
-    character(len=MAXWORDLENGTH) :: mobile_name, immobile_name, diffusion_scaling_mineral_name, decay_scaling_mineral_name
-    PetscInt :: species_id, species_im_id, diffusion_scaling_mineral_id, decay_scaling_mineral_id
-    PetscReal :: diffusion_rate, decay_rate
+    character(len=MAXWORDLENGTH) :: mobile_name, immobile_name, diffusion_scaling_mineral_name, decay_scaling_mineral_name, &
+    waste_mineral_name
+    PetscInt :: species_id, species_im_id, diffusion_scaling_mineral_id, decay_scaling_mineral_id, &
+    waste_mineral_id
+    PetscReal :: diffusion_rate, decay_rate, waste_rate
+    PetscInt :: auxiliary_offset
+    
   contains
     procedure, public :: ReadInput => DWPRead
     procedure, public :: Setup => DWPSetup
     procedure, public :: Evaluate => DWPEvaluate
+    procedure, public :: AuxiliaryPlotVariables => DWPAuxiliaryPlotVariables
+    procedure, public :: UpdateKineticState => DWPUpdateKineticState
     procedure, public :: Destroy => DWPDestroy
   end type reaction_sandbox_DWP_type
 
@@ -64,11 +70,14 @@ function DWPCreate()
 ! 4. Add code to allocate the object, initialize all variables to zero and
 !    nullify all pointers. E.g.,
   allocate(DWPCreate)
+  DWPCreate%auxiliary_offset = 0
   DWPCreate%mobile_name = ''
   DWPCreate%immobile_name = ''
+  DWPCreate%waste_mineral_name = ''
   DWPCreate%species_id = 0
   !DWPCreate%rate_immobile = 0.d0
   DWPCreate%diffusion_rate = 0.d0
+  DWPCreate%waste_rate = 0.d0
   nullify(DWPCreate%next)
 
 end function DWPCreate
@@ -151,6 +160,18 @@ subroutine DWPRead(this,input,option)
         call InputReadWord(input,option,this%decay_scaling_mineral_name,PETSC_TRUE)
         call InputErrorMsg(input,option,word, trim(error_string))
         
+        
+      case('WASTE_MINERAL')
+        call InputReadWord(input,option,this%waste_mineral_name,PETSC_TRUE)
+        call InputErrorMsg(input,option,word, trim(error_string))
+        
+      case('WASTE_RATE')
+        call InputReadDouble(input,option,this%waste_rate)
+        call InputErrorMsg(input,option,word, trim(error_string))
+        internal_units = 'unitless/sec'
+        call InputReadAndConvertUnits(input,this%waste_rate, &
+                                 internal_units, trim(error_string), option)
+        
       case('DIFFUSION_RATE')
         call InputReadDouble(input,option,this%diffusion_rate)
         call InputErrorMsg(input,option,word, trim(error_string))
@@ -192,7 +213,10 @@ subroutine DWPSetup(this,reaction,option)
   class(reaction_sandbox_DWP_type) :: this
   class(reaction_rt_type) :: reaction
   type(option_type) :: option
-
+  
+  this%auxiliary_offset = reaction%nauxiliary
+  reaction%nauxiliary = reaction%nauxiliary + 1
+  
 ! 9. Add code to initialize.
   this%species_id = &
     GetPrimarySpeciesIDFromName(this%mobile_name, reaction, option)
@@ -202,6 +226,9 @@ subroutine DWPSetup(this,reaction,option)
     GetKineticMineralIDFromName(this%diffusion_scaling_mineral_name, reaction%mineral, option)
   this%decay_scaling_mineral_id = &
     GetKineticMineralIDFromName(this%decay_scaling_mineral_name, reaction%mineral, option)
+  this%waste_mineral_id = &
+    GetKineticMineralIDFromName(this%waste_mineral_name, reaction%mineral, option)
+    
 
 end subroutine DWPSetup
 
@@ -219,6 +246,9 @@ subroutine DWPEvaluate(this,Residual,Jacobian,compute_derivative, &
   use Option_module
   use Reaction_Aux_module
   use Material_Aux_module
+  use Reactive_Transport_Aux_module
+  use Global_Aux_module
+  use Reaction_Mineral_Aux_module
 
   implicit none
 
@@ -234,8 +264,11 @@ subroutine DWPEvaluate(this,Residual,Jacobian,compute_derivative, &
   type(material_auxvar_type) :: material_auxvar
 
   PetscInt, parameter :: iphase = 1
-  PetscInt :: idof_immobile, idof_mobile
-  PetscReal :: L_water, flux_to_aq, rate, decay_rate, decay_flux
+  PetscInt :: idof_immobile, idof_mobile, idof_waste
+  PetscReal :: L_water, flux_to_aq, rate, decay_rate, decay_flux, waste_rate, waste_flux
+  PetscInt :: iauxiliary
+
+  iauxiliary = this%auxiliary_offset + 1
 
   ! Description of subroutine arguments:
 
@@ -296,19 +329,24 @@ subroutine DWPEvaluate(this,Residual,Jacobian,compute_derivative, &
   ! 1.d3 converts m^3 water -> L water
   !L_water = material_auxvar%porosity*global_auxvar%sat(iphase)* &
   !       material_auxvar%volume*1.d3
+  
   L_water = material_auxvar%porosity*global_auxvar%sat(iphase)*1.d3
   rate = this%diffusion_rate * rt_auxvar%mnrl_volfrac(this%diffusion_scaling_mineral_id)
   decay_rate = this%decay_rate * rt_auxvar%mnrl_volfrac(this%decay_scaling_mineral_id)
+  waste_rate = this%waste_rate * rt_auxvar%mnrl_volfrac(this%waste_mineral_id)  !waste_rate = this%waste_rate * rt_auxvar%mnrl_area(this%waste_mineral_id)
+  rt_auxvar%auxiliary_data(iauxiliary) = waste_rate
   
   idof_mobile = this%species_id
   idof_immobile = this%species_im_id + reaction%offset_immobile
+  
   flux_to_aq = rate * ( rt_auxvar%immobile(this%species_im_id) - rt_auxvar%total(this%species_id,iphase) ) 
-  decay_flux = decay_rate * rt_auxvar%immobile(this%species_im_id) 
+  decay_flux = decay_rate * rt_auxvar%immobile(this%species_im_id)
+  
   
   !* material_auxvar%volume 
   ! Always "subtract" the contribution from the Residual.
   Residual(idof_mobile) = Residual(idof_mobile) - flux_to_aq * L_water * material_auxvar%volume ! * rt_auxvar%total(this%species_id,iphase)
-  Residual(idof_immobile) = Residual(idof_immobile) + (flux_to_aq + decay_flux) * material_auxvar%volume
+  Residual(idof_immobile) = Residual(idof_immobile) + (flux_to_aq + decay_flux - waste_rate) * material_auxvar%volume
 
   !this%rate_D_m* &                   ! 1/s
   !                         rt_auxvar%immobile(this%D_immobile_id)* &           ! mol/m3 bulk
@@ -326,47 +364,86 @@ subroutine DWPEvaluate(this,Residual,Jacobian,compute_derivative, &
     Jacobian(idof_mobile, idof_mobile) =   Jacobian(idof_mobile, idof_mobile) + rate * L_water * material_auxvar%volume
     Jacobian(idof_mobile, idof_immobile) =   Jacobian(idof_mobile, idof_immobile) - rate * L_water * material_auxvar%volume
     Jacobian(idof_immobile, idof_mobile) =   Jacobian(idof_immobile, idof_mobile) - rate * material_auxvar%volume
-    Jacobian(idof_immobile, idof_immobile) =   Jacobian(idof_immobile, idof_immobile) + (rate + decay_rate) * material_auxvar%volume
+    Jacobian(idof_immobile, idof_immobile) =   Jacobian(idof_immobile, idof_immobile) + (rate + decay_rate - waste_rate) * & 
+      material_auxvar%volume
   
-  !    (-2.d0) * & ! negative stoichiometry
-      ! rt_auxvar%aqueous%dtotal(this%species_id,this%species_id,iphase) =
-      !   derivative of total component concentration with respect to the
-      !   free ion concentration of the same species.
-      ! kg water/L water
-  !    rt_auxvar%aqueous%dtotal(this%species_id,this%species_id,iphase)
-  !option%io_buffer = 'Analytical Jacobian calculation for this is a pain.' // &
-  ! ' Use Numerical Jacobian only!!!!'
-  !  call printErrMsg(option)
   endif
 
   
-  ! Always "subtract" the contribution from the Residual.
-  !Residual(this%species_id) = Residual(this%species_id) - &
-  !  (-1.d0) * & ! negative stoichiometry
-  !  this%rate_constant * &  ! 1/sec
-  !  L_water * & ! L water
-  !  rt_auxvar%total(this%species_id,iphase) ! mol/L water
-
-  !if (compute_derivative) then
-
-! 11. If using an analytical Jacobian, add code for the Jacobian evaluation.
-
-    ! Always "add" the contribution to the Jacobian.
-    ! Units = (mol/sec)*(kg water/mol) = kg water/sec
-  !  Jacobian(this%species_id,this%species_id) = &
-  !  Jacobian(this%species_id,this%species_id) - &
-  !    (-1.d0) * & ! negative stoichiometry
-  !    this%rate_constant * & ! 1/sec
-  !    L_water * & ! L water
-      ! rt_auxvar%aqueous%dtotal(this%species_id,this%species_id,iphase) =
-      !   derivative of total component concentration with respect to the
-      !   free ion concentration of the same species.
-      ! kg water/L water
-  !    rt_auxvar%aqueous%dtotal(this%species_id,this%species_id,iphase)
-
-  !endif
-  
 end subroutine DWPEvaluate
+
+! ************************************************************************** !
+
+subroutine DWPAuxiliaryPlotVariables(this,list,reaction,option)
+  !
+  ! Adds calcite auxiliary plot variables to output list
+  !
+  use Option_module
+  use Reaction_Aux_module
+  use Output_Aux_module
+  use Variables_module, only : REACTION_AUXILIARY
+
+  class(reaction_sandbox_DWP_type) :: this
+  type(output_variable_list_type), pointer :: list
+  type(option_type) :: option
+  class(reaction_rt_type) :: reaction
+
+  character(len=MAXWORDLENGTH) :: word
+  character(len=MAXWORDLENGTH) :: units
+
+  word = 'Dissolutional Rate'
+  units = 'mol/m^3-sec'
+  call OutputVariableAddToList(list,word,OUTPUT_RATE,units, &
+                                REACTION_AUXILIARY, &
+                                this%auxiliary_offset+1)
+
+end subroutine DWPAuxiliaryPlotVariables
+
+! *************************************************************************** !
+
+subroutine DWPUpdateKineticState(this,rt_auxvar,global_auxvar, &
+                                     material_auxvar,reaction,option)
+  !
+  ! Updates mineral volume fraction at end converged timestep based on latest
+  ! rate
+  !
+  use Option_module
+  use Reaction_Aux_module
+  use Reactive_Transport_Aux_module
+  use Global_Aux_module
+  use Material_Aux_module
+
+  implicit none
+
+  class(reaction_sandbox_DWP_type) :: this
+  type(reactive_transport_auxvar_type) :: rt_auxvar
+  type(global_auxvar_type) :: global_auxvar
+  type(material_auxvar_type) :: material_auxvar
+  class(reaction_rt_type) :: reaction
+  type(option_type) :: option
+
+  PetscInt :: waste_mnrl
+  PetscReal :: delta_volfrac
+
+  waste_mnrl = this%waste_mineral_id
+  ! rate = mol/m^3/sec
+  ! dvolfrac = m^3 mnrl/m^3 bulk = rate (mol mnrl/m^3 bulk/sec) *
+  !                                mol_vol (m^3 mnrl/mol mnrl)
+  !delta_volfrac = this%waste_rate * rt_auxvar%mnrl_volfrac(waste_mnrl) * &
+  !       option%tran_dt
+  
+  
+  delta_volfrac = rt_auxvar%auxiliary_data(this%auxiliary_offset+1)* &
+                  reaction%mineral%kinmnrl_molar_vol(waste_mnrl)* &
+                  option%tran_dt
+  ! m^3 mnrl/m^3 bulk
+  rt_auxvar%mnrl_volfrac(waste_mnrl) = rt_auxvar%mnrl_volfrac(waste_mnrl) - &
+                                  delta_volfrac
+  ! zero to avoid negative volume fractions
+  if (rt_auxvar%mnrl_volfrac(waste_mnrl) < 0.d0) &
+    rt_auxvar%mnrl_volfrac(waste_mnrl) = 0.d0
+
+end subroutine DWPUpdateKineticState
 
 ! ************************************************************************** !
 
